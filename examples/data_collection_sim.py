@@ -125,10 +125,19 @@ def main(variant):
     print('sample obs shapes', [(k, v.shape) for k, v in sample_obs.items()])
     print('sample action shape', sample_action.shape)
 
+    policy_variant = getattr(variant, 'policy', 'pi0')
     if variant.env == 'libero':
-        config = openpi_config.get_config("pi0_libero")
-        checkpoint_dir = download.maybe_download("s3://openpi-assets/checkpoints/pi0_libero")
+        if policy_variant == 'pi05':
+            config = openpi_config.get_config("pi05_libero")
+            checkpoint_dir = download.maybe_download("gs://openpi-assets/checkpoints/pi05_libero")
+        else:
+            config = openpi_config.get_config("pi0_libero")
+            checkpoint_dir = download.maybe_download("s3://openpi-assets/checkpoints/pi0_libero")
     elif variant.env == 'aloha_cube':
+        if policy_variant == 'pi05':
+            raise NotImplementedError(
+                "pi05 does not have an aloha_sim config; use --policy pi0 or add a pi05 sim config."
+            )
         config = openpi_config.get_config("pi0_aloha_sim")
         checkpoint_dir = download.maybe_download("s3://openpi-assets/checkpoints/pi0_aloha_sim")
     else:

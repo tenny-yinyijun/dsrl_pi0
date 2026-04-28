@@ -38,6 +38,8 @@ if __name__ == '__main__':
     parser.add_argument('--launch_group_id', default='')
     parser.add_argument('--eval_episodes', default=10, type=int)
     parser.add_argument('--env', default='libero')
+    parser.add_argument('--policy', default='pi0', choices=['pi0', 'pi05'],
+                        help='Pi-zero variant to load as the base policy (pi0 or pi05).')
     parser.add_argument('--log_interval', default=1000, type=int)
     parser.add_argument('--eval_interval', default=5000, type=int)
     parser.add_argument('--checkpoint_interval', default=-1, type=int)

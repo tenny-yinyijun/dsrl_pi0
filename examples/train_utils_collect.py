@@ -137,14 +137,14 @@ def collect_traj_continuous(variant, agent, env, i, agent_dp,
             if i == 0:
                 noise = jax.random.normal(key, (1, *agent.action_chunk_shape))
                 noise_repeat = jax.numpy.repeat(
-                    noise[:, -1:, :], 50 - noise.shape[1], axis=1)
+                    noise[:, -1:, :], 10 - noise.shape[1], axis=1)
                 noise = jax.numpy.concatenate([noise, noise_repeat], axis=1)
                 actions_noise = noise[0, :agent.action_chunk_shape[0], :]
             else:
                 actions_noise = agent.sample_actions(obs_dict)
                 actions_noise = np.reshape(actions_noise, agent.action_chunk_shape)
                 noise_tail = np.repeat(
-                    actions_noise[-1:, :], 50 - actions_noise.shape[0], axis=0)
+                    actions_noise[-1:, :], 10 - actions_noise.shape[0], axis=0)
                 noise = jax.numpy.concatenate(
                     [actions_noise, noise_tail], axis=0)[None]
 

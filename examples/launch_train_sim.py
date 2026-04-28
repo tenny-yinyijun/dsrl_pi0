@@ -11,6 +11,8 @@ if __name__ == '__main__':
     parser.add_argument('--launch_group_id', default='', help='group id used to group runs on wandb.')
     parser.add_argument('--eval_episodes', default=10,help='Number of episodes used for evaluation.', type=int)
     parser.add_argument('--env', default='libero', help='name of environment')
+    parser.add_argument('--policy', default='pi0', choices=['pi0', 'pi05'],
+                        help='Pi-zero variant to load as the base policy (pi0 or pi05).')
     parser.add_argument('--log_interval', default=1000, help='Logging interval.', type=int)
     parser.add_argument('--eval_interval', default=5000, help='Eval interval.', type=int)
     parser.add_argument('--checkpoint_interval', default=-1, help='checkpoint interval.', type=int)

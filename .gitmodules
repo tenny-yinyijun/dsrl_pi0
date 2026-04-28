@@ -3,4 +3,4 @@
 	url = git@github.com:nakamotoo/LIBERO.git
 [submodule "openpi"]
 	path = openpi
-	url = git@github.com:nakamotoo/openpi.git
+	url = git@github.com:tenny-yinyijun/openpi-dsrl-data.git
