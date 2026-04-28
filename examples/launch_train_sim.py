@@ -25,7 +25,27 @@ if __name__ == '__main__':
     parser.add_argument('--multi_grad_step', default=1, help='Number of graident steps to take per environment step, aka UTD', type=int)
     parser.add_argument('--resize_image', default=-1, help='the size of image if need resizing', type=int)
     parser.add_argument('--query_freq', default=-1, help='query frequency', type=int)
-    
+
+    # ---- Custom learned-reward flags (see docs/CUSTOM_REWARD.md) ----
+    parser.add_argument('--use_reward_model', default=0, type=int,
+                        help='If 1, replace the sparse -1/0 reward with a '
+                             'reward model trained from --reward_fn scores.')
+    parser.add_argument('--reward_fn', default='examples.reward_fn:score',
+                        help='Dotted import path "module:callable" of '
+                             'score(traj) -> float.')
+    parser.add_argument('--traj_batch_size', default=8, type=int,
+                        help='K — number of rollouts collected between '
+                             'reward-model updates.')
+    parser.add_argument('--reward_grad_steps', default=200, type=int,
+                        help='Reward-model gradient steps per K-trajectory '
+                             'batch.')
+    parser.add_argument('--reward_lr', default=3e-4, type=float,
+                        help='Adam LR for the reward model.')
+    parser.add_argument('--reward_relabel_buffer', default=0, type=int,
+                        help='If 1, after each reward-model update, re-label '
+                             'all transitions already in the replay buffer '
+                             'using the latest reward predictor.')
+
     train_args_dict = dict(
         actor_lr=1e-4,
         critic_lr= 3e-4,

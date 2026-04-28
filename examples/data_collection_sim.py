@@ -1,81 +1,50 @@
 #! /usr/bin/env python
+"""Continuous data-collection driver.
+
+Mirrors ``examples.train_sim`` but plugs in ``data_collection_loop`` from
+``examples.train_utils_collect``. Adds knobs for scene-reset frequency (X),
+reward+policy update frequency (Y), and on-disk libero_processed saving.
+"""
 import os
-# Tell XLA to use Triton GEMM, this improves steps/sec by ~30% on some GPUs from https://github.com/huggingface/gym-aloha/tree/main?tab=readme-ov-file#-gpu-rendering-egl
+
+# Match train_sim.py: enable Triton GEMM before importing jax.
 xla_flags = os.environ.get('XLA_FLAGS', '')
 xla_flags += ' --xla_gpu_triton_gemm_any=True'
 os.environ['XLA_FLAGS'] = xla_flags
 
-import pathlib, copy
+import copy
 import importlib
-
-import jax
-from jaxrl2.agents.pixel_sac.pixel_sac_learner import PixelSACLearner
-from jaxrl2.agents.reward_model import RewardLearner
-from jaxrl2.utils.general_utils import add_batch_dim
-import numpy as np
-
-import gymnasium as gym
-import gym_aloha
-from gym.spaces import Dict, Box
-
-from libero.libero import benchmark
-from libero.libero import get_libero_path
-from libero.libero.envs import OffScreenRenderEnv
-
-from jaxrl2.data import ReplayBuffer
-from jaxrl2.utils.wandb_logger import WandBLogger, create_exp_name
+import pathlib
 import tempfile
 from functools import partial
-from examples.train_utils_sim import trajwise_alternating_training_loop
-import tensorflow as tf
-from jax.experimental.compilation_cache import compilation_cache
 
-from openpi.training import config as openpi_config
+import jax
+import numpy as np
+import tensorflow as tf
+from gym.spaces import Box, Dict
+import gym_aloha  # noqa: F401  (registers gym envs)
+import gymnasium as gym
+
+from libero.libero import benchmark, get_libero_path
+from libero.libero.envs import OffScreenRenderEnv
+
+from jax.experimental.compilation_cache import compilation_cache
+from jaxrl2.agents.pixel_sac.pixel_sac_learner import PixelSACLearner
+from jaxrl2.agents.reward_model import RewardLearner
+from jaxrl2.data import ReplayBuffer
+from jaxrl2.utils.general_utils import add_batch_dim
+from jaxrl2.utils.wandb_logger import WandBLogger, create_exp_name
+
 from openpi.policies import policy_config
 from openpi.shared import download
+from openpi.training import config as openpi_config
+
+from examples.train_sim import DummyEnv, _get_libero_env, shard_batch
+from examples.train_utils_collect import data_collection_loop
+
 
 home_dir = os.environ['HOME']
 compilation_cache.initialize_cache(os.path.join(home_dir, 'jax_compilation_cache'))
-
-def _get_libero_env(task, resolution, seed):
-    """Initializes and returns the LIBERO environment, along with the task description."""
-    task_description = task.language
-    task_bddl_file = pathlib.Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
-    env_args = {"bddl_file_name": task_bddl_file, "camera_heights": resolution, "camera_widths": resolution}
-    env = OffScreenRenderEnv(**env_args)
-    env.seed(seed)  # IMPORTANT: seed seems to affect object positions even when using fixed initial state
-    return env, task_description
-
-def shard_batch(batch, sharding):
-    """Shards a batch across devices along its first dimension.
-
-    Args:
-        batch: A pytree of arrays.
-        sharding: A jax Sharding object with shape (num_devices,).
-    """
-    return jax.tree_util.tree_map(
-        lambda x: jax.device_put(
-            x, sharding.reshape(sharding.shape[0], *((1,) * (x.ndim - 1)))
-        ),
-        batch,
-    )
-
-
-class DummyEnv(gym.ObservationWrapper):
-
-    def __init__(self, variant):
-        self.variant = variant
-        self.image_shape = (variant.resize_image, variant.resize_image, 3 * variant.num_cameras, 1)
-        obs_dict = {}
-        obs_dict['pixels'] = Box(low=0, high=255, shape=self.image_shape, dtype=np.uint8)
-        if variant.add_states:
-            if variant.env == 'libero':
-                state_dim = 8
-            elif variant.env == 'aloha_cube':
-                state_dim = 14
-            obs_dict['state'] = Box(low=-1.0, high=1.0, shape=(state_dim, 1), dtype=np.float32)
-        self.observation_space = Dict(obs_dict)
-        self.action_space = Box(low=-1, high=1, shape=(1, 32,), dtype=np.float32) # 32 is the noise action space of pi 0
 
 
 def main(variant):
@@ -84,17 +53,15 @@ def main(variant):
     assert variant.batch_size % num_devices == 0
     print('num devices', num_devices)
     print('batch size', variant.batch_size)
-    # we shard the leading dimension (batch dimension) accross all devices evenly
     sharding = jax.sharding.PositionalSharding(devices)
     shard_fn = partial(shard_batch, sharding=sharding)
 
-    # prevent tensorflow from using GPUs
     tf.config.set_visible_devices([], "GPU")
-    
+
     kwargs = variant['train_kwargs']
     if kwargs.pop('cosine_decay', False):
         kwargs['decay_steps'] = variant.max_steps
-        
+
     if not variant.prefix:
         import uuid
         variant.prefix = str(uuid.uuid4().fields[-1])[:5]
@@ -103,21 +70,27 @@ def main(variant):
         expname = create_exp_name(variant.prefix, seed=variant.seed) + f"_{variant.suffix}"
     else:
         expname = create_exp_name(variant.prefix, seed=variant.seed)
-   
+
     outputdir = os.path.join(os.environ['EXP'], expname)
     variant.outputdir = outputdir
-    if not os.path.exists(outputdir):
-        os.makedirs(outputdir)
+    os.makedirs(outputdir, exist_ok=True)
     print('writing to output dir ', outputdir)
-    
+
+    # Default save_dir into the experiment folder if user didn't set one.
+    if not variant.save_dir:
+        variant.save_dir = os.path.join(outputdir, 'collected_data')
+    os.makedirs(variant.save_dir, exist_ok=True)
+    print('saving collected trajectories to', variant.save_dir)
+
     if variant.env == 'libero':
         benchmark_dict = benchmark.get_benchmark_dict()
-        task_suite = benchmark_dict["libero_90"]()
-        task_id = 57
-        task = task_suite.get_task(task_id)
-        env, task_description = _get_libero_env(task, 256, variant.seed)
+        task_suite = benchmark_dict[variant.task_suite_name]()
+        task = task_suite.get_task(variant.task_id)
+        env, task_description = _get_libero_env(task, variant.cam_resolution,
+                                                variant.seed)
         eval_env = env
         variant.task_description = task_description
+        variant.bddl_name = pathlib.Path(task.bddl_file).stem
         variant.env_max_reward = 1
         variant.max_timesteps = 400
     elif variant.env == 'aloha_cube':
@@ -129,22 +102,28 @@ def main(variant):
             nondeterministic=True,
             kwargs={"obs_type": "pixels", "task": "transfer_cube"},
         )
-        env = gym.make("gym_aloha/AlohaTransferCube-v0", obs_type="pixels_agent_pos", render_mode="rgb_array")
+        env = gym.make("gym_aloha/AlohaTransferCube-v0",
+                       obs_type="pixels_agent_pos", render_mode="rgb_array")
         eval_env = copy.deepcopy(env)
+        variant.task_description = ''
+        variant.bddl_name = ''
         variant.env_max_reward = 4
         variant.max_timesteps = 400
-        
+    else:
+        raise NotImplementedError(variant.env)
 
     group_name = variant.prefix + '_' + variant.launch_group_id
     wandb_output_dir = tempfile.mkdtemp()
-    wandb_logger = WandBLogger(variant.prefix != '', variant, variant.wandb_project, experiment_id=expname, output_dir=wandb_output_dir, group_name=group_name)
+    wandb_logger = WandBLogger(
+        variant.prefix != '', variant, variant.wandb_project,
+        experiment_id=expname, output_dir=wandb_output_dir,
+        group_name=group_name)
 
     dummy_env = DummyEnv(variant)
     sample_obs = add_batch_dim(dummy_env.observation_space.sample())
     sample_action = add_batch_dim(dummy_env.action_space.sample())
     print('sample obs shapes', [(k, v.shape) for k, v in sample_obs.items()])
     print('sample action shape', sample_action.shape)
-    
 
     if variant.env == 'libero':
         config = openpi_config.get_config("pi0_libero")
@@ -153,28 +132,26 @@ def main(variant):
         config = openpi_config.get_config("pi0_aloha_sim")
         checkpoint_dir = download.maybe_download("s3://openpi-assets/checkpoints/pi0_aloha_sim")
     else:
-        raise NotImplementedError()
+        raise NotImplementedError(variant.env)
     agent_dp = policy_config.create_trained_policy(config, checkpoint_dir)
     print("Loaded pi0 policy from %s", checkpoint_dir)
     agent = PixelSACLearner(variant.seed, sample_obs, sample_action, **kwargs)
 
-    online_buffer_size = variant.max_steps  // variant.multi_grad_step
-    online_replay_buffer = ReplayBuffer(dummy_env.observation_space, dummy_env.action_space, int(online_buffer_size))
-    replay_buffer = online_replay_buffer
-    replay_buffer.seed(variant.seed)
+    online_buffer_size = variant.max_steps // variant.multi_grad_step
+    online_replay_buffer = ReplayBuffer(
+        dummy_env.observation_space, dummy_env.action_space,
+        int(online_buffer_size))
+    online_replay_buffer.seed(variant.seed)
 
     reward_learner = None
     score_fn = None
     if int(getattr(variant, 'use_reward_model', 0)):
-        # Resolve the user's score(traj) -> float via "module:callable".
         spec = variant.reward_fn
         if ':' not in spec:
             raise ValueError(
                 f"--reward_fn must be of the form 'module:callable', got {spec!r}")
         mod_path, attr = spec.split(':', 1)
         score_fn = getattr(importlib.import_module(mod_path), attr)
-        # Same encoder kwargs as the SAC critic, so the reward model sees the
-        # same observation pipeline.
         reward_kwargs = dict(
             hidden_dims=kwargs.get('hidden_dims', (128, 128, 128)),
             cnn_features=kwargs.get('cnn_features', (32, 32, 32, 32)),
@@ -196,13 +173,27 @@ def main(variant):
             lr=float(variant.reward_lr),
             **reward_kwargs,
         )
-        print(f"[reward] using learned reward model. K={variant.traj_batch_size} "
+        Y = int(getattr(variant, 'reward_update_freq',
+                        variant.traj_batch_size))
+        print(f"[reward] using learned reward model. Y={Y} "
               f"reward_grad_steps={variant.reward_grad_steps} "
               f"max_traj_len={max_traj_len} score_fn={spec}")
 
-    trajwise_alternating_training_loop(
-        variant, agent, env, eval_env, online_replay_buffer, replay_buffer,
+    # Optional latent-video encoder (e.g. a VAE) for libero_processed-style
+    # `latent_videos/{cam}/<eid>.pt` files. Raw frames are saved regardless.
+    encoder = None
+    enc_spec = getattr(variant, 'latent_encoder', '') or ''
+    if enc_spec:
+        if ':' not in enc_spec:
+            raise ValueError(
+                f"--latent_encoder must be 'module:callable', got {enc_spec!r}")
+        mod_path, attr = enc_spec.split(':', 1)
+        encoder = getattr(importlib.import_module(mod_path), attr)
+        print(f"[collect] latent encoder: {enc_spec}")
+
+    data_collection_loop(
+        variant, agent, env, eval_env, online_replay_buffer,
         wandb_logger, shard_fn=shard_fn, agent_dp=agent_dp,
         reward_learner=reward_learner, score_fn=score_fn,
+        encoder=encoder,
     )
- 

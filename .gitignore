@@ -9,6 +9,7 @@ __pycache__/
 # Distribution / packaging
 .Python
 build/
+collected_data/
 develop-eggs/
 dist/
 downloads/
@@ -124,6 +125,7 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
+.claude/
 .idea/
 tmp/
 wandb_config.py
