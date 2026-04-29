@@ -99,7 +99,6 @@ export DISPLAY=:0
 export MUJOCO_GL=egl
 export PYOPENGL_PLATFORM=egl
 export MUJOCO_EGL_DEVICE_ID=0
-export OPENPI_DATA_HOME=./openpi
 export EXP=./logs/DSRL_pi0_Libero_CustomReward
 export CUDA_VISIBLE_DEVICES=0
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
