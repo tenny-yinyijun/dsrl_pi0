@@ -470,6 +470,9 @@ def data_collection_loop(variant, agent, env, eval_env,
             print(f'[collect] saved episode_id={next_episode_id:06d} '
                   f'(env_steps={traj["env_steps"]}, success={traj["is_success"]}) '
                   f'to {save_dir}.')
+            traj['_save_dir'] = save_dir
+            traj['_save_split'] = save_split
+            traj['_eid'] = f'{int(next_episode_id):06d}'
             next_episode_id += 1
 
             pending_trajs.append(traj)

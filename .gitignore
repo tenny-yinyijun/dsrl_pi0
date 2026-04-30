@@ -131,3 +131,4 @@ tmp/
 wandb_config.py
 logs/
 wandb/
+slurm_outputs/

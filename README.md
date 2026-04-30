@@ -27,6 +27,8 @@ If you find this repository useful for your research, please cite:
 ```
 
 ## Installation
+
+### Option A: conda
 1. Create a conda environment:
 ```
 conda create -n dsrl_pi0 python=3.11.11
@@ -52,6 +54,35 @@ pip install -e openpi/packages/openpi-client
 # install Libero
 pip install -e LIBERO
 pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu # needed for libero
+```
+
+### Option B: uv
+1. Clone this repo with all submodules
+```
+git clone git@github.com:nakamotoo/dsrl_pi0.git --recurse-submodules
+cd dsrl_pi0
+```
+
+2. Create a venv with Python 3.11.11
+```
+uv python install 3.11.11
+uv venv --python 3.11.11
+source .venv/bin/activate
+```
+
+3. Install all packages and dependencies
+```
+uv pip install -e .
+uv pip install -r requirements.txt
+uv pip install "jax[cuda12]==0.5.0"
+
+# install openpi
+uv pip install -e openpi
+uv pip install -e openpi/packages/openpi-client
+
+# install Libero (compat editable mode is required because of LIBERO's package layout)
+uv pip install -e LIBERO --config-settings editable_mode=compat
+uv pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu # needed for libero
 ```
 
 ## Training (Simulation)
