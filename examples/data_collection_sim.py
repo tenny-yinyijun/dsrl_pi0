@@ -154,13 +154,25 @@ def main(variant):
 
     reward_learner = None
     score_fn = None
+    score_fn_request = None
+    score_fn_await = None
     if int(getattr(variant, 'use_reward_model', 0)):
         spec = variant.reward_fn
         if ':' not in spec:
             raise ValueError(
                 f"--reward_fn must be of the form 'module:callable', got {spec!r}")
         mod_path, attr = spec.split(':', 1)
-        score_fn = getattr(importlib.import_module(mod_path), attr)
+        _mod = importlib.import_module(mod_path)
+        score_fn = getattr(_mod, attr)
+        # Optional async pair (same module, attr suffixes _request / _await).
+        # When both exist, the collection loop drops .req as soon as a traj
+        # is saved (parallel with the next rollout) and awaits at the
+        # Y-batch boundary. Falls back to sync score_fn(traj) when missing.
+        score_fn_request = getattr(_mod, attr + '_request', None)
+        score_fn_await = getattr(_mod, attr + '_await', None)
+        if score_fn_request is None or score_fn_await is None:
+            score_fn_request = None
+            score_fn_await = None
         reward_kwargs = dict(
             hidden_dims=kwargs.get('hidden_dims', (128, 128, 128)),
             cnn_features=kwargs.get('cnn_features', (32, 32, 32, 32)),
@@ -204,5 +216,7 @@ def main(variant):
         variant, agent, env, eval_env, online_replay_buffer,
         wandb_logger, shard_fn=shard_fn, agent_dp=agent_dp,
         reward_learner=reward_learner, score_fn=score_fn,
+        score_fn_request=score_fn_request,
+        score_fn_await=score_fn_await,
         encoder=encoder,
     )

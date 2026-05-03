@@ -230,6 +230,7 @@ def score_episode(
     autoregressive: bool = True,
     override_actions: Optional[torch.Tensor] = None,
     verbose: bool = True,
+    return_rgb: bool = False,
 ):
     """Roll out num_windows prediction windows from start_frame, computing
     per-frame LPIPS for each window.
@@ -242,6 +243,9 @@ def score_episode(
         per_frame_lpips: (num_windows * (num_frames - 1),) ndarray
         mean_lpips:      float
         timings:         {'diffusion': [...], 'decode': [...], 'lpips': [...]}
+        pred_rgb:        (num_windows * (num_frames - 1), H, W, 3) uint8
+                         [only when return_rgb=True]
+        gt_rgb:          same shape uint8 [only when return_rgb=True]
     """
     T_wm = latents_per_cam.shape[0]
     use_actions = override_actions if override_actions is not None else actions
@@ -360,12 +364,16 @@ def score_episode(
             break
 
     per_frame_arr = np.concatenate(per_frame_lpips_all, axis=0)
-    return {
+    out = {
         "per_frame_lpips": per_frame_arr,
         "mean_lpips": float(per_frame_arr.mean()),
         "timings": timings,
         "windows_completed": len(per_frame_lpips_all),
     }
+    if return_rgb and all_pred_rgb:
+        out["pred_rgb"] = np.concatenate(all_pred_rgb, axis=0)  # (T, H, W, 3) uint8
+        out["gt_rgb"] = np.concatenate(all_gt_rgb, axis=0)
+    return out
 
 
 # ---------------------------------------------------------------------------

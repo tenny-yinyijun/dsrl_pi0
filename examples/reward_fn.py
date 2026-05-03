@@ -114,36 +114,12 @@ DSRL_REWARD_TIMEOUT_S = float(os.environ.get("DSRL_REWARD_TIMEOUT_S", "600"))
 DSRL_REWARD_POLL_S = float(os.environ.get("DSRL_REWARD_POLL_S", "0.5"))
 
 
-def wm_score(traj) -> float:
-    """Score one trajectory by how surprised the libero world model is.
+def _wm_paths(traj) -> dict:
+    """Resolve the file-IPC paths for a trajectory's score request.
 
-    Higher = more novel = better (matches the reward intuition: novel actions
-    generate training data the WM hasn't seen, so the policy gets credit for
-    producing them).
-
-    **Requires** the trajectory to have already been saved to disk by the
-    continuous-collection loop (``data_collection_loop`` in
-    ``examples/train_utils_collect.py``). The collector injects three keys
-    into the traj dict before calling this function::
-
-        traj['_save_dir']    str — absolute path to libero_processed dir
-        traj['_save_split']  str — "train" or "val"
-        traj['_eid']         str — zero-padded 6-digit episode id
-
-    Communication with the reward server is via files under
-    ``$DSRL_REWARD_ROOT`` (must equal ``traj['_save_dir']`` or be a sibling
-    pointing at the same data, e.g. via symlink)::
-
-        <reward_root>/online/requests/<eid>.req       <- we drop this
-        <reward_root>/scores/<eid>.score.json         <- we wait for this
-
-    The reward server is the long-running open-world process; it loads the
-    WM once at startup and watches the requests dir.
-
-    Env knobs:
-        DSRL_REWARD_ROOT       (required) where the server is watching
-        DSRL_REWARD_TIMEOUT_S  max wait for a single score (default 600)
-        DSRL_REWARD_POLL_S     poll interval (default 0.5)
+    Returns a dict with all the paths needed by wm_score_request /
+    wm_score_await. Raises RuntimeError if the trajectory hasn't been
+    saved to disk yet (no _eid / _save_dir).
     """
     eid = traj.get("_eid")
     save_dir = traj.get("_save_dir")
@@ -155,36 +131,69 @@ def wm_score(traj) -> float:
             "saves trajectories to disk and injects these keys). The plain "
             "examples.train_sim path does not save trajectories."
         )
-
-    # The reward server watches <reward_root>; by default it is the same as
-    # the collector's save_dir. Override via DSRL_REWARD_ROOT if you want the
-    # daemon to read from a different (e.g. symlinked) tree.
     reward_root = DSRL_REWARD_ROOT or save_dir
-    requests_dir = os.path.join(reward_root, "requests")
-    scores_dir = os.path.join(reward_root, "scores")
-    os.makedirs(requests_dir, exist_ok=True)
-    os.makedirs(scores_dir, exist_ok=True)
+    return {
+        "eid": eid,
+        "reward_root": reward_root,
+        "requests_dir": os.path.join(reward_root, "requests"),
+        "scores_dir": os.path.join(reward_root, "scores"),
+        "ann_path": os.path.join(save_dir, "annotation", save_split, f"{eid}.json"),
+        "score_path": os.path.join(reward_root, "scores", f"{eid}.score.json"),
+        "err_path": os.path.join(reward_root, "scores", f"{eid}.error.json"),
+        "req_path": os.path.join(reward_root, "requests", f"{eid}.req"),
+    }
 
-    ann_path = os.path.join(save_dir, "annotation", save_split, f"{eid}.json")
-    if not os.path.exists(ann_path):
-        raise RuntimeError(f"wm_score: annotation not found at {ann_path}")
 
-    score_path = os.path.join(scores_dir, f"{eid}.score.json")
-    err_path = os.path.join(scores_dir, f"{eid}.error.json")
-    req_path = os.path.join(requests_dir, f"{eid}.req")
+def wm_score_request(traj) -> str:
+    """Drop a `.req` marker file for the trajectory; do NOT block.
 
-    # Drop the request (atomic via tmp-rename in case the server is mid-poll).
-    tmp = req_path + ".tmp"
+    Idempotent: if a `.score.json` (or `.error.json`) is already present
+    for this eid (e.g. from a resumed run), no new request is dropped.
+    Returns the eid for logging.
+
+    The companion ``wm_score_await(traj)`` blocks until the result lands
+    and returns the scalar score. ``wm_score(traj)`` is the sync wrapper
+    that calls request + await — preserves the existing single-call API.
+    """
+    p = _wm_paths(traj)
+    os.makedirs(p["requests_dir"], exist_ok=True)
+    os.makedirs(p["scores_dir"], exist_ok=True)
+    if not os.path.exists(p["ann_path"]):
+        raise RuntimeError(
+            f"wm_score_request: annotation not found at {p['ann_path']}")
+    # Skip if already scored (or already requested). The server treats
+    # both as no-ops too, but skipping here saves the IPC round-trip.
+    if os.path.exists(p["score_path"]) or os.path.exists(p["err_path"]):
+        return p["eid"]
+    if os.path.exists(p["req_path"]):
+        return p["eid"]
+    # Drop the request (atomic via tmp-rename so the server can't see a
+    # half-written file mid-poll).
+    tmp = p["req_path"] + ".tmp"
     with open(tmp, "w") as f:
         f.write("")  # empty marker file
-    os.replace(tmp, req_path)
+    os.replace(tmp, p["req_path"])
+    return p["eid"]
 
-    # Poll for the response.
+
+def wm_score_await(traj) -> float:
+    """Block until the score for ``traj`` is ready; return the scalar.
+
+    Stashes the full payload on ``traj['_wm_payload']`` for downstream
+    consumers (per-step reward target derivation in particular).
+    """
+    p = _wm_paths(traj)
+    eid = p["eid"]
+    score_path, err_path = p["score_path"], p["err_path"]
     deadline = time.time() + DSRL_REWARD_TIMEOUT_S
     while time.time() < deadline:
         if os.path.exists(score_path):
             with open(score_path) as f:
                 payload = json.load(f)
+            try:
+                traj["_wm_payload"] = payload
+            except TypeError:
+                pass
             return float(payload["score"])
         if os.path.exists(err_path):
             with open(err_path) as f:
@@ -194,8 +203,41 @@ def wm_score(traj) -> float:
                 f"{payload.get('error', 'unknown error')[:500]}"
             )
         time.sleep(DSRL_REWARD_POLL_S)
-
     raise TimeoutError(
-        f"wm_score: timed out after {DSRL_REWARD_TIMEOUT_S:.0f}s waiting for "
-        f"{score_path}. Is the reward server running and watching {reward_root!r}?"
+        f"wm_score: timed out after {DSRL_REWARD_TIMEOUT_S:.0f}s waiting "
+        f"for {score_path}. Is the reward server running and watching "
+        f"{p['reward_root']!r}?"
     )
+
+
+def wm_score(traj) -> float:
+    """Score one trajectory by how surprised the libero world model is.
+
+    Higher = more novel = better. Backward-compatible synchronous
+    interface: equivalent to ``wm_score_request(traj)`` immediately
+    followed by ``wm_score_await(traj)``. The collection loop auto-
+    detects the ``_request`` / ``_await`` siblings and pipelines them
+    against rollout when both are present.
+
+    **Requires** the trajectory to have already been saved to disk by the
+    continuous-collection loop (``data_collection_loop`` in
+    ``examples/train_utils_collect.py``). The collector injects three keys
+    into the traj dict before calling this function::
+
+        traj['_save_dir']    str — absolute path to libero_processed dir
+        traj['_save_split']  str — "train" or "val"
+        traj['_eid']         str — zero-padded 6-digit episode id
+
+    File-IPC layout under ``$DSRL_REWARD_ROOT`` (defaults to ``_save_dir``)::
+
+        <reward_root>/requests/<eid>.req            <- we drop this
+        <reward_root>/scores/<eid>.score.json       <- we wait for this
+        <reward_root>/scores/<eid>.error.json       <- raised as RuntimeError
+
+    Env knobs:
+        DSRL_REWARD_ROOT       (required) where the server is watching
+        DSRL_REWARD_TIMEOUT_S  max wait for a single score (default 600)
+        DSRL_REWARD_POLL_S     poll interval (default 0.5)
+    """
+    wm_score_request(traj)
+    return wm_score_await(traj)

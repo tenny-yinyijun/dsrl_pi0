@@ -370,6 +370,40 @@ def save_traj_libero_processed(traj: dict,
         json.dump(annotation, f)
 
 
+def _wm_payload_to_per_step_targets(traj, T: int, query_freq: int):
+    """Convert one trajectory's WM-frame LPIPS to per-(query-step) targets.
+
+    Returns (target_arr, mask_arr) of shape (T,) float32. Mask is 1.0 at
+    query steps that have at least one WM frame mapped to them, 0.0
+    elsewhere. When multiple WM frames map to the same query step their
+    LPIPS values are averaged.
+
+    Returns ``(None, None)`` if the trajectory has no WM payload (e.g.
+    score_fn was not the wm_score one). The caller should fall back to
+    the trajectory-level path in that case.
+    """
+    payload = traj.get('_wm_payload') if isinstance(traj, dict) else None
+    if not payload:
+        return None, None
+    per_frame = np.asarray(payload.get('per_frame_lpips', []),
+                           dtype=np.float32)
+    env_steps = np.asarray(payload.get('frame_env_steps', []),
+                           dtype=np.int64)
+    if per_frame.size == 0 or env_steps.size != per_frame.size:
+        return None, None
+    qs = env_steps // max(1, int(query_freq))
+    qs = np.clip(qs, 0, T - 1)
+    targets = np.zeros((T,), dtype=np.float32)
+    counts = np.zeros((T,), dtype=np.float32)
+    for k in range(per_frame.size):
+        q = int(qs[k])
+        targets[q] += float(per_frame[k])
+        counts[q] += 1.0
+    mask = (counts > 0).astype(np.float32)
+    targets = np.where(counts > 0, targets / np.maximum(counts, 1.0), 0.0)
+    return targets, mask
+
+
 def append_sample_index(save_dir: str, split: str, episode_id: int,
                         num_frames: int, stride: int = 2,
                         start_offset: int = 6):
@@ -394,6 +428,7 @@ def data_collection_loop(variant, agent, env, eval_env,
                          online_replay_buffer, wandb_logger,
                          shard_fn=None, agent_dp=None,
                          reward_learner=None, score_fn=None,
+                         score_fn_request=None, score_fn_await=None,
                          encoder=None,
                          perform_control_evals: bool = True):
     """Collect data continuously, train reward + policy every Y trajs.
@@ -426,6 +461,24 @@ def data_collection_loop(variant, agent, env, eval_env,
     sample_start_offset = int(getattr(variant, 'sample_start_offset', 6))
 
     use_reward_model = (reward_learner is not None) and (score_fn is not None)
+    async_scoring = (use_reward_model
+                     and score_fn_request is not None
+                     and score_fn_await is not None)
+    if async_scoring:
+        print('[reward] async scoring enabled: rollouts pipelined with WM '
+              'scoring (drop .req per-traj, await at Y-batch boundary).')
+    elif use_reward_model:
+        print('[reward] sync scoring (score_fn has no _request/_await siblings).')
+
+    # Tail the reward server's wm_finetune.jsonl so its per-cycle metrics
+    # land in the same wandb run as SAC + reward-model. Path is the
+    # reward-server's --reward-root, which the launcher script also exports
+    # as $DSRL_REWARD_ROOT.
+    wm_ft_log_path = os.path.join(
+        os.environ.get('DSRL_REWARD_ROOT', save_dir),
+        '_logs', 'wm_finetune.jsonl',
+    )
+    wm_ft_log_offset = 0  # bytes consumed so far
 
     pending_trajs = []
     num_trajs_collected = 0
@@ -484,6 +537,17 @@ def data_collection_loop(variant, agent, env, eval_env,
             traj['_eid'] = f'{int(next_episode_id):06d}'
             next_episode_id += 1
 
+            # If the score_fn supports async (request now / await at the
+            # Y-batch boundary), kick off scoring immediately so the WM
+            # works in parallel with the next rollout. Failures fall back
+            # to the sync path at await-time.
+            if async_scoring:
+                try:
+                    score_fn_request(traj)
+                except Exception as e:
+                    print(f"[reward] async request failed for "
+                          f"eid={traj['_eid']}: {e}; will retry sync at await.")
+
             pending_trajs.append(traj)
             if len(pending_trajs) < Y:
                 print(f'[collect] buffered {len(pending_trajs)}/{Y} trajs '
@@ -494,25 +558,107 @@ def data_collection_loop(variant, agent, env, eval_env,
             # Reward-model batch update (optional)
             # ----------------------------------------------------------- #
             if use_reward_model:
+                # In async mode the .req files were dropped during the
+                # rollout phase; here we just block on the results. In
+                # sync mode score_fn does request+await internally.
+                gather_fn = score_fn_await if async_scoring else score_fn
                 targets = np.array(
-                    [float(score_fn(t)) for t in pending_trajs],
+                    [float(gather_fn(t)) for t in pending_trajs],
                     dtype=np.float32)
                 print(f'[reward] f-scores: mean={targets.mean():.4f} '
                       f'std={targets.std():.4f} min={targets.min():.4f} '
                       f'max={targets.max():.4f}')
+
+                # Choose loss mode. 'per_step' uses per-WM-frame LPIPS as
+                # masked per-(query-step) targets; 'traj' uses the legacy
+                # sum-of-rewards-equals-trajectory-target loss.
+                loss_mode = str(getattr(variant, 'reward_loss_mode',
+                                        'per_step')).lower()
+                per_step_targets = None
+                per_step_masks = None
+                if loss_mode == 'per_step':
+                    per_step_targets, per_step_masks = [], []
+                    coverage = []
+                    qf = int(variant.query_freq)
+                    for traj_k in pending_trajs:
+                        Tk = len(traj_k['actions'])
+                        ts, mk = _wm_payload_to_per_step_targets(
+                            traj_k, Tk, qf)
+                        if ts is None:
+                            # Missing WM payload — fall back to traj loss.
+                            per_step_targets, per_step_masks = None, None
+                            print('[reward] per_step targets unavailable '
+                                  '(no _wm_payload); falling back to traj loss.')
+                            break
+                        per_step_targets.append(ts)
+                        per_step_masks.append(mk)
+                        coverage.append(float(mk.mean()))
+
                 last_info = {}
-                for _ in range(int(variant.reward_grad_steps)):
-                    last_info = reward_learner.update(pending_trajs, targets)
-                wandb_logger.log({
-                    'reward_model/loss': last_info.get('reward_model/loss', 0.0),
-                    'reward_model/pred_return_mean': last_info.get('reward_model/pred_return_mean', 0.0),
-                    'reward_model/pred_return_std': last_info.get('reward_model/pred_return_std', 0.0),
-                    'reward_model/target_return_mean': last_info.get('reward_model/target_return_mean', 0.0),
-                    'reward_model/target_return_std': last_info.get('reward_model/target_return_std', 0.0),
-                    'reward_model/updates': last_info.get('reward_model/updates', 0.0),
-                    'reward_model/f_score_mean': float(targets.mean()),
-                    'reward_model/f_score_std': float(targets.std()),
-                }, step=i)
+                if loss_mode == 'per_step' and per_step_targets is not None:
+                    for _ in range(int(variant.reward_grad_steps)):
+                        last_info = reward_learner.update_per_step(
+                            pending_trajs, per_step_targets, per_step_masks)
+                    cov_mean = float(np.mean(coverage)) if coverage else 0.0
+                    wandb_logger.log({
+                        'reward_model/loss': last_info.get('reward_model/loss', 0.0),
+                        'reward_model/pred_return_mean': last_info.get('reward_model/pred_return_mean', 0.0),
+                        'reward_model/pred_return_std': last_info.get('reward_model/pred_return_std', 0.0),
+                        'reward_model/target_return_mean': last_info.get('reward_model/target_return_mean', 0.0),
+                        'reward_model/target_return_std': last_info.get('reward_model/target_return_std', 0.0),
+                        'reward_model/pred_step_mean': last_info.get('reward_model/pred_step_mean', 0.0),
+                        'reward_model/pred_step_std': last_info.get('reward_model/pred_step_std', 0.0),
+                        'reward_model/target_step_mean': last_info.get('reward_model/target_step_mean', 0.0),
+                        'reward_model/target_step_std': last_info.get('reward_model/target_step_std', 0.0),
+                        'reward_model/coverage': last_info.get('reward_model/coverage', cov_mean),
+                        'reward_model/updates': last_info.get('reward_model/updates', 0.0),
+                        'reward_model/f_score_mean': float(targets.mean()),
+                        'reward_model/f_score_std': float(targets.std()),
+                        'reward_model/loss_mode': 1.0,  # 1.0 = per_step
+                    }, step=i)
+                else:
+                    for _ in range(int(variant.reward_grad_steps)):
+                        last_info = reward_learner.update(pending_trajs, targets)
+                    wandb_logger.log({
+                        'reward_model/loss': last_info.get('reward_model/loss', 0.0),
+                        'reward_model/pred_return_mean': last_info.get('reward_model/pred_return_mean', 0.0),
+                        'reward_model/pred_return_std': last_info.get('reward_model/pred_return_std', 0.0),
+                        'reward_model/target_return_mean': last_info.get('reward_model/target_return_mean', 0.0),
+                        'reward_model/target_return_std': last_info.get('reward_model/target_return_std', 0.0),
+                        'reward_model/updates': last_info.get('reward_model/updates', 0.0),
+                        'reward_model/f_score_mean': float(targets.mean()),
+                        'reward_model/f_score_std': float(targets.std()),
+                        'reward_model/loss_mode': 0.0,  # 0.0 = traj
+                    }, step=i)
+
+                # Drain any new WM fine-tune cycle metrics written by the
+                # reward server and forward them to wandb.
+                if os.path.exists(wm_ft_log_path):
+                    try:
+                        with open(wm_ft_log_path, 'rb') as f:
+                            f.seek(wm_ft_log_offset)
+                            new_bytes = f.read()
+                            wm_ft_log_offset = f.tell()
+                        for line in new_bytes.decode('utf-8',
+                                                    errors='replace').splitlines():
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                rec = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue  # likely a partial last line
+                            wandb_logger.log({
+                                'wm_finetune/loss_first': float(rec.get('loss_first', 0.0)),
+                                'wm_finetune/loss_last':  float(rec.get('loss_last', 0.0)),
+                                'wm_finetune/loss_mean':  float(rec.get('loss_mean', 0.0)),
+                                'wm_finetune/global_step': int(rec.get('global_step', 0)),
+                                'wm_finetune/cycles_done': int(rec.get('cycles_done', 0)),
+                                'wm_finetune/buffer_size': int(rec.get('buffer_size', 0)),
+                                'wm_finetune/elapsed_s':  float(rec.get('elapsed_s', 0.0)),
+                            }, step=i)
+                    except Exception as e:
+                        print(f'[collect] WARN: failed to tail {wm_ft_log_path}: {e}')
 
                 # Re-label per-step rewards for the Y trajectories with r̂.
                 for traj_k in pending_trajs:

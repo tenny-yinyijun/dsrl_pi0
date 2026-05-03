@@ -207,6 +207,39 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
     tmp.replace(path)
 
 
+def _write_mp4(path: Path, frames_thwc_uint8: np.ndarray, fps: int = 10):
+    """Write (T, H, W, C) uint8 frames as an H.264 mp4. macro_block_size=1
+    so non-multiple-of-16 sizes (e.g. 64×64) encode as-is."""
+    import imageio.v2 as imageio
+
+    if frames_thwc_uint8.dtype != np.uint8:
+        frames_thwc_uint8 = frames_thwc_uint8.astype(np.uint8)
+    writer = imageio.get_writer(
+        str(path), fps=int(fps), codec="libx264", quality=8,
+        macro_block_size=1, format="FFMPEG",
+    )
+    try:
+        for f in frames_thwc_uint8:
+            writer.append_data(f)
+    finally:
+        writer.close()
+
+
+def _save_wm_predictions(reward_root: Path, eid: str, pred_rgb: np.ndarray,
+                         gt_rgb: np.ndarray, fps: int = 10) -> dict:
+    """Write a single side-by-side (GT | pred) mp4 under
+    <reward_root>/wm_predictions/<eid>/. Returns the relative path suitable
+    for the score payload."""
+    out_dir = reward_root / "wm_predictions" / eid
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # Align lengths defensively (pred/gt should match, but guard anyway).
+    T = min(pred_rgb.shape[0], gt_rgb.shape[0])
+    side_by_side = np.concatenate([gt_rgb[:T], pred_rgb[:T]], axis=2)
+    video_path = out_dir / "gt_vs_pred.mp4"
+    _write_mp4(video_path, side_by_side, fps=fps)
+    return {"video_path": str(video_path.relative_to(reward_root))}
+
+
 # ---------------------------------------------------------------------------
 # Online WM fine-tuner
 # ---------------------------------------------------------------------------
@@ -259,6 +292,9 @@ class WMFineTuner:
 
         self.ckpt_dir = Path(args.reward_root) / "wm_checkpoints"
         self.ckpt_dir.mkdir(parents=True, exist_ok=True)
+        self.metrics_dir = Path(args.reward_root) / "_logs"
+        self.metrics_dir.mkdir(parents=True, exist_ok=True)
+        self.metrics_path = self.metrics_dir / "wm_finetune.jsonl"
 
         # Buffer holds CPU tensors so we don't blow up GPU memory.
         # Each entry: (latents_per_cam_cpu_fp32, actions_cpu_fp32, text_str)
@@ -350,9 +386,15 @@ class WMFineTuner:
                 batch_act.append(w["action"])
                 batch_txt.append(w["text"][0])
 
+            # The model's unet / action_encoder are bf16 (cast in
+            # score_traj.build_model). Buffer storage is fp32 on CPU for
+            # numerical safety; cast to bf16 on the way to the GPU so the
+            # first matmul doesn't trip the "mat1/mat2 dtype mismatch".
             batch = {
-                "latent": torch.cat(batch_lat, dim=0).to(self.device),
-                "action": torch.cat(batch_act, dim=0).to(self.device),
+                "latent": torch.cat(batch_lat, dim=0).to(
+                    device=self.device, dtype=torch.bfloat16),
+                "action": torch.cat(batch_act, dim=0).to(
+                    device=self.device, dtype=torch.bfloat16),
                 "text": batch_txt,
             }
 
@@ -394,7 +436,62 @@ class WMFineTuner:
             print(f"[wm-ft] saved checkpoint {ckpt}")
             info["ckpt_path"] = str(ckpt)
 
+        # Append a JSONL line so progress is inspectable after the run.
+        try:
+            line = {"ts": time.time(), **info}
+            with self.metrics_path.open("a") as f:
+                f.write(json.dumps(line) + "\n")
+        except Exception as e:
+            print(f"[wm-ft] WARN: failed to append metrics log: {e}")
+
         return info
+
+
+def _spread_start_frames(start_frame: int, num_passes: int,
+                         windows_per_call: int, num_frames: int,
+                         T_wm: int, random: bool = False,
+                         rng: "np.random.Generator | None" = None) -> list[int]:
+    """Return ``num_passes`` start frames covering the trajectory.
+
+    Each scoring call is autoregressive over ``windows_per_call`` windows
+    (each window consumes ``num_frames-1`` WM frames), so a single call's
+    chunk spans ``windows_per_call*(num_frames-1)`` WM frames. The last
+    valid start is therefore ``T_wm - windows_per_call*(num_frames-1)``.
+
+    ``random=False``: linspace placement (deterministic, even spacing,
+    same answer every call) — current default behavior.
+    ``random=True``: stratified random — divide the legal range into
+    ``num_passes`` equal strata and pick a uniform-random integer in each.
+    Each call still typically lands in a different region of the
+    trajectory, but with episode-to-episode jitter the WM sees different
+    parts of the dynamics over the long run.
+
+    Falls back to ``[start_frame]`` when there's no room (very short traj).
+    """
+    span = max(0, int(windows_per_call) * max(0, num_frames - 1))
+    last_valid = max(int(start_frame), int(T_wm) - span)
+    if num_passes <= 1 or last_valid <= int(start_frame):
+        return [int(start_frame)]
+    if random:
+        rng = rng if rng is not None else np.random.default_rng()
+        edges = np.linspace(int(start_frame), int(last_valid), num_passes + 1)
+        out = []
+        for i in range(num_passes):
+            lo, hi = float(edges[i]), float(edges[i + 1])
+            if hi <= lo + 1.0:
+                out.append(int(round(lo)))
+            else:
+                # Use integer endpoints for the random draw so two calls
+                # in adjacent strata can't accidentally land at the same
+                # frame.
+                lo_i = int(np.floor(lo))
+                hi_i = max(lo_i + 1, int(np.ceil(hi)))
+                out.append(int(rng.integers(lo_i, hi_i)))  # [lo_i, hi_i)
+        return [int(np.clip(s, int(start_frame), int(last_valid))) for s in out]
+    starts = np.linspace(int(start_frame), int(last_valid), num=num_passes)
+    starts = np.unique(np.clip(np.round(starts).astype(np.int64),
+                               int(start_frame), int(last_valid)))
+    return [int(s) for s in starts]
 
 
 def serve(args, cfg, model, pipeline, pipeline_cls, lpips_fn, device,
@@ -405,8 +502,37 @@ def serve(args, cfg, model, pipeline, pipeline_cls, lpips_fn, device,
     requests_dir.mkdir(parents=True, exist_ok=True)
     scores_dir.mkdir(parents=True, exist_ok=True)
 
+    save_preds = bool(args.save_wm_predictions)
+    pred_every = max(1, int(args.wm_predictions_every))
+    if save_preds:
+        (reward_root / "wm_predictions").mkdir(parents=True, exist_ok=True)
+        print(f"[server] saving WM predictions every {pred_every} scored episode(s) "
+              f"to {reward_root / 'wm_predictions'}")
+
+    scoring_mode = str(args.scoring_mode).lower()
+    if scoring_mode not in ("contiguous", "spread"):
+        raise ValueError(f"--scoring-mode must be contiguous|spread, got {scoring_mode!r}")
+
+    # Resolve the (num_passes, windows_per_call) plan. CLI args win when
+    # > 0; otherwise fall back to the legacy interpretation of --num-windows
+    # so existing scripts/runs keep behaving identically.
+    if int(args.num_passes) > 0 and int(args.windows_per_call) > 0:
+        num_passes = int(args.num_passes)
+        windows_per_call = int(args.windows_per_call)
+    elif scoring_mode == "contiguous":
+        num_passes = 1
+        windows_per_call = int(args.num_windows)
+    else:  # spread
+        num_passes = int(args.num_windows)
+        windows_per_call = 1
+    random_spread = bool(args.random_spread)
+    rng = np.random.default_rng(int(args.spread_seed)
+                                if args.spread_seed is not None else None)
+
+    print(f"[server] scoring_mode={scoring_mode}  num_passes={num_passes}  "
+          f"windows_per_call={windows_per_call}  random_spread={random_spread}  "
+          f"start_frame={args.start_frame}  num_windows(legacy)={args.num_windows}")
     print(f"[server] watching {requests_dir} ; writing to {scores_dir}")
-    print(f"[server] num_windows={args.num_windows}  start_frame={args.start_frame}")
 
     served = 0
     while True:
@@ -445,42 +571,115 @@ def serve(args, cfg, model, pipeline, pipeline_cls, lpips_fn, device,
                 else annotation.get("language_instruction", "")
             )
 
-            result = score_episode(
-                model=model,
-                pipeline=pipeline,
-                pipeline_cls=pipeline_cls,
-                cfg=cfg,
-                latents_per_cam=latents_per_cam,
-                actions=actions,
-                text=text,
-                start_frame=args.start_frame,
-                num_windows=args.num_windows,
-                skip_his=args.skip_his,
-                lpips_fn=lpips_fn,
-                device=device,
-                autoregressive=True,
-                verbose=False,
-            )
-            score = result["mean_lpips"]
+            want_rgb = save_preds and (served % pred_every == 0)
+
+            # Plan cursor positions for this request.
+            #   contiguous: 1 call × windows_per_call windows from start_frame
+            #               (the call is autoregressive across its windows;
+            #               error compounds — the legacy behavior).
+            #   spread:     num_passes calls × windows_per_call windows each.
+            #               Each call is autoregressive within its chunk
+            #               (so a 4-window pass yields 4 contiguous predicted
+            #               frames with the original error-compounding
+            #               characteristic) but starts fresh from GT history,
+            #               so error does NOT compound across passes.
+            if scoring_mode == "spread":
+                start_positions = _spread_start_frames(
+                    start_frame=int(args.start_frame),
+                    num_passes=num_passes,
+                    windows_per_call=windows_per_call,
+                    num_frames=int(cfg.num_frames),
+                    T_wm=int(T_wm),
+                    random=random_spread,
+                    rng=rng,
+                )
+                per_call_windows = windows_per_call
+                # Within each chunk we want the autoregressive behavior so
+                # the multi-window-per-call setup actually exercises the
+                # WM's compounding error. Across chunks, history is reset
+                # to GT (handled by score_episode at window 0 of each call).
+                autoregressive = True
+            else:
+                start_positions = [int(args.start_frame)]
+                per_call_windows = windows_per_call
+                autoregressive = True
+
+            per_frame_lpips_all = []
+            frame_wm_idx_all = []
+            windows_completed_total = 0
+            pred_rgb_pieces = []
+            gt_rgb_pieces = []
+
+            for s_pos in start_positions:
+                result = score_episode(
+                    model=model,
+                    pipeline=pipeline,
+                    pipeline_cls=pipeline_cls,
+                    cfg=cfg,
+                    latents_per_cam=latents_per_cam,
+                    actions=actions,
+                    text=text,
+                    start_frame=s_pos,
+                    num_windows=per_call_windows,
+                    skip_his=args.skip_his,
+                    lpips_fn=lpips_fn,
+                    device=device,
+                    autoregressive=autoregressive,
+                    verbose=False,
+                    return_rgb=want_rgb,
+                )
+                pf = list(result["per_frame_lpips"])
+                per_frame_lpips_all.extend(float(x) for x in pf)
+                # WM-time index of the k-th LPIPS entry from this call is
+                # s_pos + 1 + k (see score_traj.score_episode: cursor +1
+                # to cursor + num_frames - 1, then cursor advances).
+                frame_wm_idx_all.extend(int(s_pos) + 1 + k for k in range(len(pf)))
+                windows_completed_total += int(result["windows_completed"])
+                if want_rgb and "pred_rgb" in result:
+                    pred_rgb_pieces.append(result["pred_rgb"])
+                    gt_rgb_pieces.append(result["gt_rgb"])
+
             elapsed = time.perf_counter() - t0
+            score = float(np.mean(per_frame_lpips_all)) if per_frame_lpips_all else float("nan")
+            frame_env_steps_all = [int(i * cfg.down_sample) for i in frame_wm_idx_all]
 
             payload = {
                 "score": score,
-                "per_frame_lpips": result["per_frame_lpips"].tolist(),
-                "windows_completed": result["windows_completed"],
+                "per_frame_lpips": per_frame_lpips_all,
+                "frame_wm_idx": frame_wm_idx_all,
+                "frame_env_steps": frame_env_steps_all,
+                "wm_start_frame": int(args.start_frame),
+                "wm_start_positions": start_positions,
+                "wm_num_frames": int(cfg.num_frames),
+                "wm_down_sample": int(cfg.down_sample),
+                "scoring_mode": scoring_mode,
+                "num_windows": int(args.num_windows),
+                "windows_completed": int(windows_completed_total),
                 "elapsed_s": elapsed,
                 "wm_ckpt": args.ckpt_path,
                 "wm_step": _maybe_step(args.ckpt_path),
+                "wm_finetune_step": (finetuner.global_step if finetuner is not None else None),
                 "T_wm": int(T_wm),
                 "suite": suite,
                 "eid": eid,
             }
+            if want_rgb and pred_rgb_pieces:
+                try:
+                    pred_concat = np.concatenate(pred_rgb_pieces, axis=0)
+                    gt_concat = np.concatenate(gt_rgb_pieces, axis=0)
+                    pred_meta = _save_wm_predictions(
+                        reward_root, eid, pred_concat, gt_concat,
+                        fps=int(getattr(cfg, "fps", 10)),
+                    )
+                    payload.update(pred_meta)
+                except Exception as e:
+                    print(f"[server] WARN: failed to save WM predictions for {eid}: {e}")
             _atomic_write_json(score_path, payload)
             req.unlink(missing_ok=True)
             served += 1
             print(
                 f"[server] [{served:5d}] eid={eid}  score={score:.4f}  "
-                f"windows={result['windows_completed']}  "
+                f"windows={windows_completed_total}  passes={len(start_positions)}  "
                 f"elapsed={elapsed:.2f}s  T_wm={T_wm}"
             )
 
@@ -531,6 +730,36 @@ def main() -> None:
     parser.add_argument("--num-windows", type=int, default=8)
     parser.add_argument("--start-frame", type=int, default=6)
     parser.add_argument("--skip-his", type=int, default=4)
+    parser.add_argument(
+        "--scoring-mode", default="contiguous",
+        choices=["contiguous", "spread"],
+        help="contiguous: one autoregressive call from --start-frame "
+             "(legacy). spread: --num-passes calls placed across the "
+             "trajectory, each starting from GT history (no compounding "
+             "error across passes). Use spread for full-trajectory coverage.",
+    )
+    parser.add_argument(
+        "--num-passes", type=int, default=-1,
+        help="Number of independent scoring calls per trajectory. "
+             "Default -1 = legacy: 1 (contiguous) or --num-windows (spread).",
+    )
+    parser.add_argument(
+        "--windows-per-call", type=int, default=-1,
+        help="Windows scored per call (autoregressive within a call). "
+             "Default -1 = legacy: --num-windows (contiguous) or 1 (spread).",
+    )
+    parser.add_argument(
+        "--random-spread", action="store_true",
+        help="Spread mode only: stratified-random pass placement instead "
+             "of evenly spaced. Each pass picks a random integer start in "
+             "its stratum so the WM sees different parts of the dynamics "
+             "across episodes. Off by default (deterministic linspace).",
+    )
+    parser.add_argument(
+        "--spread-seed", type=int, default=None,
+        help="Optional RNG seed for --random-spread placement. None = "
+             "non-deterministic (different placement every episode).",
+    )
     parser.add_argument("--num-inference-steps", type=int, default=0)
     parser.add_argument("--poll-interval", type=float, default=0.25)
     parser.add_argument("--device", default="cuda:0")
@@ -553,6 +782,15 @@ def main() -> None:
     parser.add_argument("--wm-checkpoint-every", type=int, default=1,
                         help="Save checkpoint every N completed cycles. "
                              "0 disables checkpointing.")
+
+    # ----- WM-prediction saving -----
+    parser.add_argument("--save-wm-predictions", type=int, default=1,
+                        help="If 1 (default), save a single side-by-side "
+                             "GT|pred mp4 to <reward_root>/wm_predictions/"
+                             "<eid>/gt_vs_pred.mp4 for inspection.")
+    parser.add_argument("--wm-predictions-every", type=int, default=1,
+                        help="Save predictions every N scored episodes. "
+                             "1 = every episode (a few MB each).")
     args = parser.parse_args()
 
     device = torch.device(args.device)

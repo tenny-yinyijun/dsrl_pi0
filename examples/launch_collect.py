@@ -70,6 +70,14 @@ if __name__ == '__main__':
     parser.add_argument('--reward_grad_steps', default=200, type=int)
     parser.add_argument('--reward_lr', default=3e-4, type=float)
     parser.add_argument('--reward_relabel_buffer', default=0, type=int)
+    parser.add_argument('--reward_loss_mode', default='per_step',
+                        choices=['traj', 'per_step'],
+                        help='How to fit the reward model. "per_step" uses '
+                             'per-WM-frame LPIPS as masked per-(query-step) '
+                             'targets (finer credit assignment). "traj" '
+                             'uses the legacy sum-of-rewards = trajectory-'
+                             'target loss. Falls back to "traj" silently if '
+                             'WM payload is missing.')
 
     # -------- New flags for continuous collection -------- #
     parser.add_argument('--scene_reset_freq', default=1, type=int,

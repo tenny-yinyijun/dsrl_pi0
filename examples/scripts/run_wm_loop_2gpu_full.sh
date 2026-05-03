@@ -52,31 +52,55 @@ fi
 REWARD_GPU="${REWARD_GPU:-0}"
 TRAINER_GPU="${TRAINER_GPU:-1}"
 
-# WM scoring (production-ish, but a touch faster than the 50-step / 8-window
-# default so each request returns in ~30s instead of ~2min).
-NUM_WINDOWS="${NUM_WINDOWS:-4}"
+# WM scoring. SCORING_MODE=spread + RANDOM_SPREAD=1 places NUM_PASSES
+# autoregressive chunks at stratified-random positions across the
+# trajectory. Each chunk runs WINDOWS_PER_CALL contiguous windows, so a
+# single chunk covers WINDOWS_PER_CALL * (cfg.num_frames-1) WM frames
+# with the original WM error-compounding behavior (good signal). Across
+# chunks, history is reset to GT — no compounding across the trajectory.
+#   defaults: 5 chunks × 4 windows × 4 frames = 80 WM frames per traj
+#             ≈ same coverage as the prior 20-pass setup, but each chunk
+#             is autoregressive so the LPIPS values are richer per call.
+NUM_WINDOWS="${NUM_WINDOWS:-20}"        # legacy total; ignored when
+                                        # NUM_PASSES & WINDOWS_PER_CALL set.
+NUM_PASSES="${NUM_PASSES:-5}"
+WINDOWS_PER_CALL="${WINDOWS_PER_CALL:-4}"
+RANDOM_SPREAD="${RANDOM_SPREAD:-1}"
 START_FRAME="${START_FRAME:-6}"
 NUM_INFERENCE_STEPS="${NUM_INFERENCE_STEPS:-25}"
+SCORING_MODE="${SCORING_MODE:-spread}"
 
 # WM fine-tuning controls (enabled by default in this script).
+# Updates fire every 20 scored episodes (less often than the 8 we originally
+# had) and each cycle does more work per update (50 grad steps × batch 2)
+# so the WM moves in larger, more stable steps. Combined with
+# WM_CHECKPOINT_EVERY=1 this yields ~1 checkpoint per 20 episodes.
 ENABLE_WM_FINETUNE="${ENABLE_WM_FINETUNE:-1}"
-WM_UPDATE_EVERY="${WM_UPDATE_EVERY:-8}"
-WM_GRAD_STEPS="${WM_GRAD_STEPS:-25}"
-WM_BATCH_SIZE="${WM_BATCH_SIZE:-1}"
+WM_UPDATE_EVERY="${WM_UPDATE_EVERY:-20}"
+WM_GRAD_STEPS="${WM_GRAD_STEPS:-50}"
+WM_BATCH_SIZE="${WM_BATCH_SIZE:-2}"
 WM_LR="${WM_LR:-1e-5}"
 WM_MAX_GRAD_NORM="${WM_MAX_GRAD_NORM:-1.0}"
 WM_BUFFER_SIZE="${WM_BUFFER_SIZE:-64}"
 WM_CHECKPOINT_EVERY="${WM_CHECKPOINT_EVERY:-1}"
 
 # SAC training.
+# MULTI_GRAD_STEP=10 (was 50) — 5× fewer SAC updates per env transition,
+# so the actor moves more gradually and is less likely to diverge from π₀.
+# CHECKPOINT_INTERVAL=5000 (was 500) — at the new step rate that lands
+# roughly one SAC ckpt every ~12 episodes, comparable to the WM cadence.
 TRAJ_BATCH="${TRAJ_BATCH:-4}"
 START_ONLINE_UPDATES="${START_ONLINE_UPDATES:-10}"
-MULTI_GRAD_STEP="${MULTI_GRAD_STEP:-50}"
+MULTI_GRAD_STEP="${MULTI_GRAD_STEP:-10}"
 REWARD_GRAD_STEPS="${REWARD_GRAD_STEPS:-200}"
 REWARD_LR="${REWARD_LR:-3e-4}"
+# 'per_step' = supervise the reward model with per-WM-frame LPIPS at the
+# corresponding query-step (finer credit assignment than the legacy
+# 'traj' loss, which only fits Σ r̂ = mean LPIPS per trajectory).
+REWARD_LOSS_MODE="${REWARD_LOSS_MODE:-per_step}"
 ACTION_MAGNITUDE="${ACTION_MAGNITUDE:-1.0}"  # hard boundary on SAC noise
 BASE_POLICY_PROB="${BASE_POLICY_PROB:-0.5}"  # 50% pure π₀ episodes
-CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-500}"
+CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-5000}"
 
 # Run length (real run, not a smoketest).
 MAX_TRAJS="${MAX_TRAJS:-1000000}"
@@ -85,7 +109,7 @@ MAX_STEPS="${MAX_STEPS:-500000}"
 TASK_SUITE="${TASK_SUITE:-libero_90}"
 TASK_ID="${TASK_ID:-57}"
 
-SERVER_READY_TIMEOUT_S="${SERVER_READY_TIMEOUT_S:-1200}"
+SERVER_READY_TIMEOUT_S="${SERVER_READY_TIMEOUT_S:-2400}"
 
 # ---------------------------------------------------------------------------
 # Offline env
@@ -176,8 +200,12 @@ fi
         --ckpt-path "$WM_CKPT" \
         --dataset-root "$WM_DATASET_ROOT" \
         --num-windows "$NUM_WINDOWS" \
+        --num-passes "$NUM_PASSES" \
+        --windows-per-call "$WINDOWS_PER_CALL" \
+        $( [ "$RANDOM_SPREAD" = "1" ] && echo "--random-spread" ) \
         --start-frame "$START_FRAME" \
         --num-inference-steps "$NUM_INFERENCE_STEPS" \
+        --scoring-mode "$SCORING_MODE" \
         --device "cuda:0" \
         "${WM_FT_ARGS[@]}" \
         > "$SERVER_LOG" 2>&1
@@ -256,6 +284,7 @@ python3 examples/launch_collect.py \
     --reward_grad_steps "$REWARD_GRAD_STEPS" \
     --reward_lr "$REWARD_LR" \
     --reward_relabel_buffer 0 \
+    --reward_loss_mode "$REWARD_LOSS_MODE" \
     --scene_reset_freq 1 \
     --reward_update_freq "$TRAJ_BATCH" \
     --base_policy_prob "$BASE_POLICY_PROB" \

@@ -101,6 +101,68 @@ def _update_step(rng, state, apply_fn, obs, actions, mask, targets):
 
 
 @partial(jax.jit, static_argnames=("apply_fn",))
+def _update_step_per_step(rng, state, apply_fn, obs, actions, mask, targets):
+    """Per-(query-step) MSE: loss = mean over masked positions of
+    ``(r̂(o_t, a_t) - target_t)^2``.
+
+    Shapes:
+      mask     (K, T_max)   1.0 where target_t is valid, 0.0 otherwise
+      targets  (K, T_max)
+    """
+    K, T = mask.shape
+
+    def flatten(x):
+        return x.reshape((K * T,) + x.shape[2:])
+
+    obs_flat = jax.tree_util.tree_map(flatten, obs)
+    act_flat = flatten(actions)
+
+    def loss_fn(params):
+        if state.batch_stats is None:
+            r_flat = apply_fn({"params": params}, obs_flat, act_flat,
+                              training=True)
+            new_batch_stats = None
+        else:
+            r_flat, mutated = apply_fn(
+                {"params": params, "batch_stats": state.batch_stats},
+                obs_flat, act_flat, training=True,
+                mutable=["batch_stats"])
+            new_batch_stats = mutated["batch_stats"]
+        r = r_flat.reshape(K, T)
+        sq = ((r - targets) ** 2) * mask
+        denom = jnp.maximum(mask.sum(), 1.0)
+        loss = sq.sum() / denom
+        return loss, (r, new_batch_stats)
+
+    grads, (r, new_batch_stats) = jax.grad(
+        loss_fn, has_aux=True)(state.params)
+    new_state = state.apply_gradients(grads=grads)
+    if new_batch_stats is not None:
+        new_state = new_state.replace(batch_stats=new_batch_stats)
+    sq = ((r - targets) ** 2) * mask
+    denom = jnp.maximum(mask.sum(), 1.0)
+    loss = sq.sum() / denom
+    # Reduce per-step preds + targets only over masked positions for logging.
+    pred_sum = (r * mask).sum(axis=1)
+    target_sum = (targets * mask).sum(axis=1)
+    info = {
+        "reward_model/loss": loss,
+        "reward_model/pred_step_mean": (r * mask).sum() / denom,
+        "reward_model/pred_step_std": jnp.sqrt(
+            ((((r - (r * mask).sum() / denom)) ** 2) * mask).sum() / denom),
+        "reward_model/target_step_mean": (targets * mask).sum() / denom,
+        "reward_model/target_step_std": jnp.sqrt(
+            ((((targets - (targets * mask).sum() / denom)) ** 2) * mask).sum() / denom),
+        "reward_model/pred_return_mean": pred_sum.mean(),
+        "reward_model/pred_return_std": pred_sum.std(),
+        "reward_model/target_return_mean": target_sum.mean(),
+        "reward_model/target_return_std": target_sum.std(),
+        "reward_model/coverage": mask.mean(),
+    }
+    return rng, new_state, info
+
+
+@partial(jax.jit, static_argnames=("apply_fn",))
 def _predict_step(state, apply_fn, obs, actions):
     if state.batch_stats is None:
         return apply_fn({"params": state.params}, obs, actions, training=False)
@@ -236,6 +298,44 @@ class RewardLearner:
         new_rng, new_state, info = _update_step(
             self._rng, self._state, self._apply_fn,
             obs_batch, act_batch, mask_batch, targets)
+        self._rng = new_rng
+        self._state = new_state
+        self.num_updates += 1
+        info = {k: float(jax.device_get(v)) for k, v in info.items()}
+        info["reward_model/updates"] = float(self.num_updates)
+        return info
+
+    def update_per_step(self, trajs, per_step_targets,
+                        per_step_masks) -> Dict[str, float]:
+        """One gradient step of masked per-(query-step) MSE.
+
+        per_step_targets / per_step_masks: lists of length K, each entry a
+        (T,) numpy array (T may differ per traj; the trajectory mask from
+        ``_pack_batch`` further AND-ed with these so padded positions are
+        zeroed out automatically).
+        """
+        obs_batch, act_batch, traj_mask = self._pack_batch(trajs)
+        K, T_max = traj_mask.shape
+
+        tgt = np.zeros((K, T_max), dtype=np.float32)
+        msk = np.zeros((K, T_max), dtype=np.float32)
+        for k, (t, m) in enumerate(zip(per_step_targets, per_step_masks)):
+            t = np.asarray(t, dtype=np.float32)
+            m = np.asarray(m, dtype=np.float32)
+            L = min(t.shape[0], T_max)
+            tgt[k, :L] = t[:L]
+            msk[k, :L] = m[:L]
+        # Zero out padded positions even if the user-supplied mask says 1.
+        msk = msk * traj_mask
+
+        obs_batch = {k: jnp.asarray(v) for k, v in obs_batch.items()}
+        act_batch = jnp.asarray(act_batch)
+        msk_j = jnp.asarray(msk)
+        tgt_j = jnp.asarray(tgt)
+
+        new_rng, new_state, info = _update_step_per_step(
+            self._rng, self._state, self._apply_fn,
+            obs_batch, act_batch, msk_j, tgt_j)
         self._rng = new_rng
         self._state = new_state
         self.num_updates += 1
