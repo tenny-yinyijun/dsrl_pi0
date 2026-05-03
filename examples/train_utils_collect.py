@@ -83,6 +83,15 @@ def collect_traj_continuous(variant, agent, env, i, agent_dp,
 
     agent._rng, rng = jax.random.split(agent._rng)
 
+    # Decide once per episode whether to use the base (pi0) policy with
+    # fresh gaussian noise instead of the SAC-chosen noise. This keeps
+    # some clean-data trajectories in the buffer even while SAC explores.
+    base_policy_prob = float(getattr(variant, 'base_policy_prob', 0.0))
+    use_base_policy = (i > 0 and base_policy_prob > 0.0
+                       and np.random.rand() < base_policy_prob)
+    if use_base_policy:
+        print('[collect] this episode: BASE POLICY (fresh gaussian noise)')
+
     if do_reset or carry_obs is None:
         if 'libero' in variant.env:
             obs = env.reset()
@@ -134,7 +143,7 @@ def collect_traj_continuous(variant, agent, env, i, agent_dp,
             assert agent_dp is not None
             rng, key = jax.random.split(rng)
             obs_pi_zero = obs_to_pi_zero_input(obs, variant)
-            if i == 0:
+            if i == 0 or use_base_policy:
                 noise = jax.random.normal(key, (1, *agent.action_chunk_shape))
                 noise_repeat = jax.numpy.repeat(
                     noise[:, -1:, :], 10 - noise.shape[1], axis=1)

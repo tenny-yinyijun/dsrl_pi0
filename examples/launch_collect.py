@@ -54,6 +54,12 @@ if __name__ == '__main__':
     parser.add_argument('--multi_grad_step', default=1, type=int)
     parser.add_argument('--resize_image', default=-1, type=int)
     parser.add_argument('--query_freq', default=-1, type=int)
+    parser.add_argument('--base_policy_prob', default=0.0, type=float,
+                        help='Per-episode probability of using fresh gaussian '
+                             'noise (i.e. base pi0 behavior) instead of the '
+                             'SAC-chosen noise. 0.0 = always use SAC once it '
+                             'has updates, 1.0 = always pi0. Useful to keep '
+                             'some clean-data trajectories while exploring.')
 
     # -------- Reward-model flags (carried over) -------- #
     parser.add_argument('--use_reward_model', default=0, type=int)

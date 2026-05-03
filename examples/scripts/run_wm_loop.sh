@@ -46,8 +46,21 @@ REWARD_ROOT="${REWARD_ROOT:-/scratch/gpfs/AM43/yy4041/wm_reward_runs/$JOB_TAG}"
 # WM checkpoint the daemon scores against.
 WM_CKPT="${WM_CKPT:-$OPEN_WORLD_ROOT/models/wm_training/libero_0429/checkpoint-20000.pt}"
 
+# Pretraining dataset root (provides stat.json for action normalization).
+WM_DATASET_ROOT="${WM_DATASET_ROOT:-$OPEN_WORLD_ROOT/data/libero_processed}"
+
 # Pi0 variant. Must match what setup_caches.sh fetched.
 POLICY="${POLICY:-pi05}"
+
+# Action chunk size differs by policy: pi=50, pi05=10. query_freq must be <=
+# the chunk size, otherwise actions[t % query_freq] indexes past the chunk.
+if [ -z "${QUERY_FREQ:-}" ]; then
+    if [ "$POLICY" = "pi05" ]; then
+        QUERY_FREQ=10
+    else
+        QUERY_FREQ=20
+    fi
+fi
 
 # Single-GPU mode: both processes share GPU 0 (memory-tight but simplest).
 # For two GPUs: bump #SBATCH --gres=gpu:2 above and set REWARD_GPU=1.
@@ -87,6 +100,7 @@ REQUIRED=(
     "$OPEN_WORLD_ROOT/external/clip-vit-base-patch32"
     "$TORCH_HOME/hub/checkpoints/alexnet-owt-7be5be79.pth"
     "$WM_CKPT"
+    "$WM_DATASET_ROOT/stat.json"
     "$PI_CACHE"
 )
 for f in "${REQUIRED[@]}"; do
@@ -118,10 +132,12 @@ echo "[run_wm_loop] starting reward server (logs -> $SERVER_LOG)"
     CUDA_VISIBLE_DEVICES=$REWARD_GPU \
     OPEN_WORLD_ROOT="$OPEN_WORLD_ROOT" \
     HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
-    "$OPEN_WORLD_ROOT/.venv/bin/python" \
+    PYTHONUNBUFFERED=1 \
+    "$OPEN_WORLD_ROOT/.venv/bin/python" -u \
         "$DSRL_ROOT/examples/reward_model/reward_server.py" \
         --reward-root "$REWARD_ROOT" \
         --ckpt-path "$WM_CKPT" \
+        --dataset-root "$WM_DATASET_ROOT" \
         --num-windows "$NUM_WINDOWS" \
         --start-frame "$START_FRAME" \
         --num-inference-steps "$NUM_INFERENCE_STEPS" \
@@ -202,7 +218,7 @@ python3 examples/launch_collect.py \
     --start_online_updates 500 \
     --resize_image 64 \
     --action_magnitude 1.0 \
-    --query_freq 20 \
+    --query_freq "$QUERY_FREQ" \
     --hidden_dims 128 \
     --use_reward_model 1 \
     --reward_fn examples.reward_fn:wm_score \

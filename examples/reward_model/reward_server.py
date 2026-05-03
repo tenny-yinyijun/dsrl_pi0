@@ -1,5 +1,6 @@
 """Reward-server daemon: holds the libero world model in memory and scores
-trajectories submitted by the dsrl_pi0 trainer.
+trajectories submitted by the dsrl_pi0 trainer. Optionally fine-tunes the
+WM online on the scored trajectories.
 
 Communication is via the on-disk ``libero_processed`` layout that
 ``examples/data_collection_sim.py`` already produces. The daemon polls a
@@ -30,8 +31,12 @@ prediction and the recorded rollout. When the WM thinks "I expected this", LPIPS
 is low; when the trajectory is novel/unfamiliar, LPIPS is high. The dsrl_pi0
 trainer uses this directly as ``f(traj)`` (no negation needed).
 
-Fine-tuning is **not yet implemented** — the daemon just scores. A separate
-periodic hook (every R requests) will be added in a follow-up.
+Optional fine-tuning is enabled with --enable-wm-finetune. Every
+``--wm-update-every`` scored episodes the daemon runs ``--wm-grad-steps``
+gradient steps using a small CPU buffer of recently-scored
+``(latents, actions, text)`` tuples, then writes a fresh checkpoint to
+``<reward_root>/wm_checkpoints/checkpoint-<step>.pt``. Subsequent scoring
+calls reflect the updated weights.
 """
 from __future__ import annotations
 
@@ -202,7 +207,198 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
     tmp.replace(path)
 
 
-def serve(args, cfg, model, pipeline, pipeline_cls, lpips_fn, device, dataset_root):
+# ---------------------------------------------------------------------------
+# Online WM fine-tuner
+# ---------------------------------------------------------------------------
+
+class WMFineTuner:
+    """Tiny online fine-tuner: keeps a CPU buffer of recently-scored
+    trajectories and runs a few SGD steps every N scores.
+
+    Training is done in the same dtype the model is loaded in (bf16 for
+    unet/action_encoder, frozen bf16 for vae/image_encoder). AdamW moments
+    stay in fp32 by default. This is intentionally minimal — for serious
+    WM fine-tuning use scripts/train_libero_wm.py with proper accelerate.
+    """
+
+    def __init__(self, *, model, cfg, device, args):
+        from collections import deque
+
+        self.model = model
+        self.cfg = cfg
+        self.device = device
+
+        # Only train unet + action_encoder. Freeze vae / image_encoder / text
+        # encoder — they are the heavy frozen backbones and fine-tuning them
+        # online with batch_size=1 would just make scoring noisier.
+        self.trainable_params = []
+        for name in ("unet", "action_encoder"):
+            mod = getattr(model, name, None) or getattr(model.pipeline, name, None)
+            if mod is None:
+                continue
+            for p in mod.parameters():
+                p.requires_grad = True
+                self.trainable_params.append(p)
+        for name in ("vae", "image_encoder", "text_encoder"):
+            mod = getattr(model.pipeline, name, None) or getattr(model, name, None)
+            if mod is None:
+                continue
+            for p in mod.parameters():
+                p.requires_grad = False
+
+        self.optimizer = torch.optim.AdamW(
+            self.trainable_params, lr=args.wm_lr, betas=(0.9, 0.999),
+            weight_decay=0.01,
+        )
+        self.update_every = int(args.wm_update_every)
+        self.grad_steps = int(args.wm_grad_steps)
+        self.batch_size = int(args.wm_batch_size)
+        self.max_grad_norm = float(args.wm_max_grad_norm)
+        self.buffer_max = int(args.wm_buffer_size)
+        self.checkpoint_every = int(args.wm_checkpoint_every)
+
+        self.ckpt_dir = Path(args.reward_root) / "wm_checkpoints"
+        self.ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+        # Buffer holds CPU tensors so we don't blow up GPU memory.
+        # Each entry: (latents_per_cam_cpu_fp32, actions_cpu_fp32, text_str)
+        self.buffer = deque(maxlen=self.buffer_max)
+        self.global_step = 0   # number of grad steps taken
+        self.cycles_done = 0
+        self.scored_since_update = 0
+
+        n_train = sum(p.numel() for p in self.trainable_params)
+        print(f"[wm-ft] trainable params: {n_train/1e6:.2f}M  "
+              f"buffer_max={self.buffer_max}  update_every={self.update_every}  "
+              f"grad_steps={self.grad_steps}  batch_size={self.batch_size}  "
+              f"lr={args.wm_lr}  ckpt_dir={self.ckpt_dir}")
+
+    def add_sample(self, latents_per_cam, actions, text):
+        """Buffer a freshly-scored trajectory for later training."""
+        self.buffer.append(
+            (latents_per_cam.detach().to("cpu", torch.float32),
+             actions.detach().to("cpu", torch.float32),
+             text)
+        )
+        self.scored_since_update += 1
+
+    def _sample_window(self, latents_per_cam, actions, text):
+        """Pick a random (num_history + num_frames)-length window and stack
+        cameras vertically, matching what LiberoLatentDataset returns.
+
+        latents_per_cam: (T, num_cams, 4, h, w)
+        actions:         (T, action_dim)
+        Returns dict with 'latent' (1,F,4,total_h,w), 'action' (1,F,A), 'text'.
+        """
+        cfg = self.cfg
+        F = cfg.num_history + cfg.num_frames
+        T = latents_per_cam.shape[0]
+        if T < F:
+            # Pad by repeating last frame.
+            pad = F - T
+            latents_per_cam = torch.cat(
+                [latents_per_cam,
+                 latents_per_cam[-1:].expand(pad, -1, -1, -1, -1)], dim=0)
+            actions = torch.cat(
+                [actions, actions[-1:].expand(pad, -1)], dim=0)
+            T = F
+        start = int(np.random.randint(0, T - F + 1))
+        lat_win = latents_per_cam[start : start + F]   # (F, num_cams, 4, h, w)
+        act_win = actions[start : start + F]           # (F, A)
+        # Stack cams along H -> (F, 4, num_cams*h, w)
+        lat_stacked = torch.cat(
+            [lat_win[:, m] for m in range(lat_win.shape[1])], dim=-2)
+        return {
+            "latent": lat_stacked.unsqueeze(0),     # (1, F, 4, total_h, w)
+            "action": act_win.unsqueeze(0),         # (1, F, A)
+            "text": [text],
+        }
+
+    def maybe_step(self):
+        """If enough scores have accumulated since the last cycle, run
+        ``grad_steps`` updates, save a checkpoint, and reset counters."""
+        if self.update_every <= 0:
+            return None
+        if self.scored_since_update < self.update_every:
+            return None
+        if len(self.buffer) == 0:
+            self.scored_since_update = 0
+            return None
+
+        self.model.train()
+        # vae/image_encoder/text_encoder were frozen in __init__, but
+        # model.train() flips their training-mode flag too; re-eval them so
+        # any internal eval-only behavior stays correct.
+        for name in ("vae", "image_encoder", "text_encoder"):
+            mod = getattr(self.model.pipeline, name, None) \
+                  or getattr(self.model, name, None)
+            if mod is not None:
+                mod.eval()
+
+        losses = []
+        t0 = time.perf_counter()
+        for k in range(self.grad_steps):
+            self.optimizer.zero_grad(set_to_none=True)
+
+            # Sample a batch of B (window) dicts and stack.
+            batch_lat, batch_act, batch_txt = [], [], []
+            for _ in range(self.batch_size):
+                idx = int(np.random.randint(0, len(self.buffer)))
+                lat, act, txt = self.buffer[idx]
+                w = self._sample_window(lat, act, txt)
+                batch_lat.append(w["latent"])
+                batch_act.append(w["action"])
+                batch_txt.append(w["text"][0])
+
+            batch = {
+                "latent": torch.cat(batch_lat, dim=0).to(self.device),
+                "action": torch.cat(batch_act, dim=0).to(self.device),
+                "text": batch_txt,
+            }
+
+            loss, _ = self.model(batch)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                self.trainable_params, self.max_grad_norm)
+            self.optimizer.step()
+            self.global_step += 1
+            losses.append(float(loss.detach().to("cpu", torch.float32).item()))
+
+        self.model.eval()
+        self.scored_since_update = 0
+        self.cycles_done += 1
+
+        elapsed = time.perf_counter() - t0
+        info = {
+            "loss_first": losses[0],
+            "loss_last": losses[-1],
+            "loss_mean": float(np.mean(losses)),
+            "global_step": self.global_step,
+            "cycles_done": self.cycles_done,
+            "buffer_size": len(self.buffer),
+            "elapsed_s": elapsed,
+        }
+        print(
+            f"[wm-ft] cycle={self.cycles_done}  step={self.global_step}  "
+            f"loss {losses[0]:.4f} -> {losses[-1]:.4f} (mean {info['loss_mean']:.4f})  "
+            f"buf={len(self.buffer)}  elapsed={elapsed:.1f}s"
+        )
+
+        # Save checkpoint.
+        if self.checkpoint_every > 0 and (self.cycles_done % self.checkpoint_every) == 0:
+            ckpt = self.ckpt_dir / f"checkpoint-{self.global_step}.pt"
+            torch.save(self.model.state_dict(), ckpt)
+            # Also write a "latest" pointer so external readers know the
+            # current ckpt.
+            (self.ckpt_dir / "latest.txt").write_text(str(ckpt.name) + "\n")
+            print(f"[wm-ft] saved checkpoint {ckpt}")
+            info["ckpt_path"] = str(ckpt)
+
+        return info
+
+
+def serve(args, cfg, model, pipeline, pipeline_cls, lpips_fn, device,
+          dataset_root, finetuner=None):
     reward_root = Path(args.reward_root)
     requests_dir = reward_root / "requests"
     scores_dir = reward_root / "scores"
@@ -287,6 +483,10 @@ def serve(args, cfg, model, pipeline, pipeline_cls, lpips_fn, device, dataset_ro
                 f"windows={result['windows_completed']}  "
                 f"elapsed={elapsed:.2f}s  T_wm={T_wm}"
             )
+
+            if finetuner is not None:
+                finetuner.add_sample(latents_per_cam, actions, text)
+                finetuner.maybe_step()
         except Exception:
             err_path = scores_dir / f"{eid}.error.json"
             tb = traceback.format_exc()
@@ -334,6 +534,25 @@ def main() -> None:
     parser.add_argument("--num-inference-steps", type=int, default=0)
     parser.add_argument("--poll-interval", type=float, default=0.25)
     parser.add_argument("--device", default="cuda:0")
+
+    # ----- Online WM fine-tuning -----
+    parser.add_argument("--enable-wm-finetune", action="store_true",
+                        help="Run online WM fine-tuning every "
+                             "--wm-update-every scored episodes.")
+    parser.add_argument("--wm-update-every", type=int, default=8,
+                        help="Run a fine-tune cycle every N scored episodes.")
+    parser.add_argument("--wm-grad-steps", type=int, default=25,
+                        help="Gradient steps per fine-tune cycle.")
+    parser.add_argument("--wm-batch-size", type=int, default=1,
+                        help="Window-batch size per gradient step.")
+    parser.add_argument("--wm-lr", type=float, default=1e-5,
+                        help="AdamW learning rate for fine-tuning.")
+    parser.add_argument("--wm-max-grad-norm", type=float, default=1.0)
+    parser.add_argument("--wm-buffer-size", type=int, default=64,
+                        help="Max scored-episode tuples kept on CPU.")
+    parser.add_argument("--wm-checkpoint-every", type=int, default=1,
+                        help="Save checkpoint every N completed cycles. "
+                             "0 disables checkpointing.")
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -354,6 +573,10 @@ def main() -> None:
     import lpips as lpips_mod
     lpips_fn = lpips_mod.LPIPS(net="alex", verbose=False).to(device).eval()
 
+    finetuner = None
+    if args.enable_wm_finetune:
+        finetuner = WMFineTuner(model=model, cfg=cfg, device=device, args=args)
+
     print(f"[server] ready. polling every {args.poll_interval}s")
     serve(
         args=args,
@@ -364,6 +587,7 @@ def main() -> None:
         lpips_fn=lpips_fn,
         device=device,
         dataset_root=Path(args.dataset_root),
+        finetuner=finetuner,
     )
 
 

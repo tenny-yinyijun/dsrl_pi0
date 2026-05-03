@@ -13,10 +13,10 @@
 
 set -euo pipefail
 
-DSRL_ROOT="${DSRL_ROOT:-/scratch/gpfs/AM43/yy4041/dsrl_pi0}"
-OPEN_WORLD_ROOT="${OPEN_WORLD_ROOT:-/scratch/gpfs/AM43/yy4041/open-world}"
+DSRL_ROOT="${DSRL_ROOT:-/n/fs/iromdata/project/dsrl_pi0}"
+OPEN_WORLD_ROOT="${OPEN_WORLD_ROOT:-/n/fs/iromdata/project/open-world}"
 POLICY="${POLICY:-pi05}"
-TORCH_HOME="${TORCH_HOME:-/scratch/gpfs/AM43/yy4041/.cache/torch}"
+TORCH_HOME="${TORCH_HOME:-/n/fs/tom-project/.cache/torch}"
 
 ok() { printf '  \033[32mOK\033[0m  %s\n' "$1"; }
 miss() { printf '  \033[31mMISSING\033[0m  %s\n' "$1"; }
@@ -74,7 +74,7 @@ fi
 # ---- 5. Pi055 LIBERO checkpoint ----
 note "5) Pi05 LIBERO checkpoint ($POLICY)"
 PI_VARIANT="${POLICY}_libero"
-PI_CACHE="/scratch/gpfs/AM43/yy4041/.cache/openpi/openpi-assets/checkpoints/$PI_VARIANT"
+PI_CACHE="/n/fs/tom-project/.cache/openpi/openpi-assets/checkpoints/$PI_VARIANT"
 if [ -d "$PI_CACHE" ] && [ -d "$PI_CACHE/params" ]; then
     ok "$PI_CACHE"
 else
