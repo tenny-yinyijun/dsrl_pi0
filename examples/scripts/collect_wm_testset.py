@@ -108,11 +108,14 @@ def _settle(env, n_steps: int):
 
 
 def _record_obs(obs, raw_agentview, wrist_images, raw_state_list):
+    # H-flip only — matches open-world's preprocess_libero_for_wm.py
+    # convention (what the WM was trained on). The 180° rotation π₀
+    # expects is applied at the policy boundary, not in saved frames.
     raw_agentview.append(
-        np.ascontiguousarray(obs["agentview_image"][::-1, ::-1]).copy()
+        np.ascontiguousarray(obs["agentview_image"][::-1]).copy()
     )
     wrist_images.append(
-        np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1]).copy()
+        np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1]).copy()
     )
     cart = np.concatenate(
         (obs["robot0_eef_pos"], _quat2axisangle(obs["robot0_eef_quat"]))

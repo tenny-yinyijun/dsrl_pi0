@@ -163,10 +163,14 @@ def collect_traj_continuous(variant, agent, env, i, agent_dp,
 
         # Snapshot full-resolution observation pieces for libero_processed.
         if 'libero' in variant.env:
+            # MuJoCo offscreen renders are bottom-up: H-flip only, matching
+            # open-world's preprocess_libero_for_wm.py (the convention the
+            # WM was trained on). The 180° rotation π₀ expects is applied
+            # at the policy boundary in obs_to_pi_zero_input, not here.
             raw_agentview_list.append(
-                np.ascontiguousarray(obs["agentview_image"][::-1, ::-1]).copy())
+                np.ascontiguousarray(obs["agentview_image"][::-1]).copy())
             wrist_image_list.append(
-                np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1]).copy())
+                np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1]).copy())
             cart_pos = np.concatenate(
                 (obs["robot0_eef_pos"], _quat2axisangle(obs["robot0_eef_quat"]))
             ).astype(np.float32)
@@ -200,9 +204,9 @@ def collect_traj_continuous(variant, agent, env, i, agent_dp,
     image_list.append(curr_image)
     if 'libero' in variant.env:
         raw_agentview_list.append(
-            np.ascontiguousarray(obs["agentview_image"][::-1, ::-1]).copy())
+            np.ascontiguousarray(obs["agentview_image"][::-1]).copy())
         wrist_image_list.append(
-            np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1]).copy())
+            np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1]).copy())
         cart_pos = np.concatenate(
             (obs["robot0_eef_pos"], _quat2axisangle(obs["robot0_eef_quat"]))
         ).astype(np.float32)
@@ -486,6 +490,7 @@ def data_collection_loop(variant, agent, env, eval_env,
     i = 0
     last_obs = None  # carry obs forward when not resetting
     must_reset_after_eval = False
+    is_first_await = True  # only print the cold-start caveat once
 
     wandb_logger.log({'num_online_samples': 0}, step=i)
     wandb_logger.log({'num_online_trajs': 0}, step=i)
@@ -562,6 +567,21 @@ def data_collection_loop(variant, agent, env, eval_env,
                 # rollout phase; here we just block on the results. In
                 # sync mode score_fn does request+await internally.
                 gather_fn = score_fn_await if async_scoring else score_fn
+                mode_str = 'async' if async_scoring else 'sync'
+                if is_first_await:
+                    print(
+                        f'[reward] awaiting scores for {len(pending_trajs)} '
+                        f'traj(s) from reward server ({mode_str} mode). '
+                        f'First WM call after server start can take 60-180s '
+                        f'while CUDA kernels warm up.', flush=True
+                    )
+                    is_first_await = False
+                else:
+                    print(
+                        f'[reward] awaiting scores for {len(pending_trajs)} '
+                        f'traj(s) from reward server ({mode_str} mode).',
+                        flush=True
+                    )
                 targets = np.array(
                     [float(gather_fn(t)) for t in pending_trajs],
                     dtype=np.float32)

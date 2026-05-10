@@ -254,12 +254,17 @@ class WMFineTuner:
     WM fine-tuning use scripts/train_libero_wm.py with proper accelerate.
     """
 
-    def __init__(self, *, model, cfg, device, args):
+    def __init__(self, *, model, cfg, device, args,
+                 pipeline=None, pipeline_cls=None, lpips_fn=None):
         from collections import deque
 
         self.model = model
         self.cfg = cfg
         self.device = device
+        # Held for the optional before/after sanity-check rendering.
+        self.pipeline = pipeline
+        self.pipeline_cls = pipeline_cls
+        self.lpips_fn = lpips_fn
 
         # Only train unet + action_encoder. Freeze vae / image_encoder / text
         # encoder — they are the heavy frozen backbones and fine-tuning them
@@ -296,8 +301,26 @@ class WMFineTuner:
         self.metrics_dir.mkdir(parents=True, exist_ok=True)
         self.metrics_path = self.metrics_dir / "wm_finetune.jsonl"
 
+        # Sanity-check: render WM rollouts on the K most-recent training
+        # trajectories both before and after each fine-tune cycle, so the
+        # effect of the update is visually inspectable.
+        self.sanity_enabled = bool(int(getattr(args, "wm_sanity_check", 1)))
+        self.sanity_num_trajs = int(getattr(args, "wm_sanity_num_trajs", 2))
+        self.sanity_windows = int(getattr(args, "wm_sanity_windows", 8))
+        self.sanity_start_frame = int(getattr(
+            args, "wm_sanity_start_frame", args.start_frame))
+        self.sanity_dir = Path(args.reward_root) / "wm_update_sanity_check"
+        if self.sanity_enabled:
+            self.sanity_dir.mkdir(parents=True, exist_ok=True)
+        # If we don't have the pieces score_episode needs, silently disable.
+        if self.sanity_enabled and (self.pipeline is None
+                                    or self.pipeline_cls is None
+                                    or self.lpips_fn is None):
+            print("[wm-ft] sanity-check disabled: pipeline/lpips not provided")
+            self.sanity_enabled = False
+
         # Buffer holds CPU tensors so we don't blow up GPU memory.
-        # Each entry: (latents_per_cam_cpu_fp32, actions_cpu_fp32, text_str)
+        # Each entry: (latents_per_cam_cpu_fp32, actions_cpu_fp32, text_str, eid)
         self.buffer = deque(maxlen=self.buffer_max)
         self.global_step = 0   # number of grad steps taken
         self.cycles_done = 0
@@ -308,13 +331,17 @@ class WMFineTuner:
               f"buffer_max={self.buffer_max}  update_every={self.update_every}  "
               f"grad_steps={self.grad_steps}  batch_size={self.batch_size}  "
               f"lr={args.wm_lr}  ckpt_dir={self.ckpt_dir}")
+        if self.sanity_enabled:
+            print(f"[wm-ft] sanity-check on: num_trajs={self.sanity_num_trajs}  "
+                  f"windows={self.sanity_windows}  "
+                  f"start_frame={self.sanity_start_frame}  dir={self.sanity_dir}")
 
-    def add_sample(self, latents_per_cam, actions, text):
+    def add_sample(self, latents_per_cam, actions, text, eid=""):
         """Buffer a freshly-scored trajectory for later training."""
         self.buffer.append(
             (latents_per_cam.detach().to("cpu", torch.float32),
              actions.detach().to("cpu", torch.float32),
-             text)
+             text, str(eid))
         )
         self.scored_since_update += 1
 
@@ -361,6 +388,18 @@ class WMFineTuner:
             self.scored_since_update = 0
             return None
 
+        # Pick the K most-recent buffer entries as the sanity-check fixtures
+        # (these are the trajectories most likely to drive this cycle's
+        # gradients — the K most recently appended scored episodes).
+        cycle_id = self.cycles_done
+        if self.sanity_enabled and self.sanity_num_trajs > 0:
+            k = min(self.sanity_num_trajs, len(self.buffer))
+            sanity_targets = list(self.buffer)[-k:]
+        else:
+            sanity_targets = []
+
+        before_renders = self._render_sanity(sanity_targets) if sanity_targets else []
+
         self.model.train()
         # vae/image_encoder/text_encoder were frozen in __init__, but
         # model.train() flips their training-mode flag too; re-eval them so
@@ -380,7 +419,7 @@ class WMFineTuner:
             batch_lat, batch_act, batch_txt = [], [], []
             for _ in range(self.batch_size):
                 idx = int(np.random.randint(0, len(self.buffer)))
-                lat, act, txt = self.buffer[idx]
+                lat, act, txt, _eid = self.buffer[idx]
                 w = self._sample_window(lat, act, txt)
                 batch_lat.append(w["latent"])
                 batch_act.append(w["action"])
@@ -390,6 +429,9 @@ class WMFineTuner:
             # score_traj.build_model). Buffer storage is fp32 on CPU for
             # numerical safety; cast to bf16 on the way to the GPU so the
             # first matmul doesn't trip the "mat1/mat2 dtype mismatch".
+            # Autocast handles the remaining fp32 tensors created inside
+            # _predict_v (sigma, c_in, c_noise, ...) which would otherwise
+            # leave input_latents / t_emb as fp32 against bf16 weights.
             batch = {
                 "latent": torch.cat(batch_lat, dim=0).to(
                     device=self.device, dtype=torch.bfloat16),
@@ -398,7 +440,9 @@ class WMFineTuner:
                 "text": batch_txt,
             }
 
-            loss, _ = self.model(batch)
+            with torch.autocast(device_type=self.device.type,
+                                dtype=torch.bfloat16):
+                loss, _ = self.model(batch)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
                 self.trainable_params, self.max_grad_norm)
@@ -409,6 +453,11 @@ class WMFineTuner:
         self.model.eval()
         self.scored_since_update = 0
         self.cycles_done += 1
+
+        # Render the same trajectories AFTER the update and pair the videos.
+        if before_renders:
+            after_renders = self._render_sanity(sanity_targets)
+            self._save_sanity_videos(cycle_id, before_renders, after_renders)
 
         elapsed = time.perf_counter() - t0
         info = {
@@ -445,6 +494,63 @@ class WMFineTuner:
             print(f"[wm-ft] WARN: failed to append metrics log: {e}")
 
         return info
+
+    # ---- Sanity-check: render before/after rollouts on training trajs ----
+
+    def _render_sanity(self, targets):
+        """For each (lat, act, txt, eid), run an autoregressive WM rollout
+        and return [(eid, pred_rgb, gt_rgb), ...]. Failures are logged and
+        skipped — this is best-effort instrumentation."""
+        out = []
+        skip_his = int(getattr(self.cfg, "num_history", 4))
+        for lat, act, txt, eid in targets:
+            try:
+                with torch.no_grad():
+                    result = score_episode(
+                        model=self.model,
+                        pipeline=self.pipeline,
+                        pipeline_cls=self.pipeline_cls,
+                        cfg=self.cfg,
+                        latents_per_cam=lat,
+                        actions=act,
+                        text=txt,
+                        start_frame=self.sanity_start_frame,
+                        num_windows=self.sanity_windows,
+                        skip_his=skip_his,
+                        lpips_fn=self.lpips_fn,
+                        device=self.device,
+                        autoregressive=True,
+                        verbose=False,
+                        return_rgb=True,
+                    )
+                if "pred_rgb" in result and "gt_rgb" in result:
+                    out.append((eid, result["pred_rgb"], result["gt_rgb"]))
+            except Exception as e:
+                print(f"[wm-ft] sanity render failed for eid={eid}: {e}")
+        return out
+
+    def _save_sanity_videos(self, cycle_id, before, after):
+        """Write GT | before-pred | after-pred side-by-side mp4 per traj."""
+        out_dir = self.sanity_dir / f"update_{cycle_id}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        before_map = {eid: (pred, gt) for eid, pred, gt in before}
+        after_map = {eid: (pred, gt) for eid, pred, gt in after}
+        fps = int(getattr(self.cfg, "fps", 10))
+        for eid in before_map:
+            if eid not in after_map:
+                continue
+            pred_b, gt_b = before_map[eid]
+            pred_a, _gt_a = after_map[eid]
+            T = min(gt_b.shape[0], pred_b.shape[0], pred_a.shape[0])
+            grid = np.concatenate(
+                [gt_b[:T], pred_b[:T], pred_a[:T]], axis=2
+            )  # (T, H, 3W, 3) -- left=GT, mid=before, right=after
+            path = out_dir / f"{eid}_before_after.mp4"
+            try:
+                _write_mp4(path, grid, fps=fps)
+                print(f"[wm-ft] sanity video: {path}")
+            except Exception as e:
+                print(f"[wm-ft] WARN: failed to write sanity video for {eid}: {e}")
 
 
 def _spread_start_frames(start_frame: int, num_passes: int,
@@ -684,7 +790,7 @@ def serve(args, cfg, model, pipeline, pipeline_cls, lpips_fn, device,
             )
 
             if finetuner is not None:
-                finetuner.add_sample(latents_per_cam, actions, text)
+                finetuner.add_sample(latents_per_cam, actions, text, eid)
                 finetuner.maybe_step()
         except Exception:
             err_path = scores_dir / f"{eid}.error.json"
@@ -783,6 +889,22 @@ def main() -> None:
                         help="Save checkpoint every N completed cycles. "
                              "0 disables checkpointing.")
 
+    # ----- WM update sanity-check (before/after replay videos) -----
+    parser.add_argument("--wm-sanity-check", type=int, default=1,
+                        help="If 1 (default) and --enable-wm-finetune is on, "
+                             "render WM rollouts on the K most-recent training "
+                             "trajectories both before and after each fine-tune "
+                             "cycle and save side-by-side mp4s under "
+                             "<reward_root>/wm_update_sanity_check/update_<n>/.")
+    parser.add_argument("--wm-sanity-num-trajs", type=int, default=2,
+                        help="Number of recent training trajectories to render "
+                             "per fine-tune cycle.")
+    parser.add_argument("--wm-sanity-windows", type=int, default=8,
+                        help="Autoregressive windows per sanity-check rollout.")
+    parser.add_argument("--wm-sanity-start-frame", type=int, default=-1,
+                        help="Start frame for sanity-check rollouts. -1 = "
+                             "fall back to --start-frame.")
+
     # ----- WM-prediction saving -----
     parser.add_argument("--save-wm-predictions", type=int, default=1,
                         help="If 1 (default), save a single side-by-side "
@@ -811,9 +933,16 @@ def main() -> None:
     import lpips as lpips_mod
     lpips_fn = lpips_mod.LPIPS(net="alex", verbose=False).to(device).eval()
 
+    # Resolve sanity-check start frame: -1 => use --start-frame.
+    if int(args.wm_sanity_start_frame) < 0:
+        args.wm_sanity_start_frame = int(args.start_frame)
+
     finetuner = None
     if args.enable_wm_finetune:
-        finetuner = WMFineTuner(model=model, cfg=cfg, device=device, args=args)
+        finetuner = WMFineTuner(
+            model=model, cfg=cfg, device=device, args=args,
+            pipeline=pipeline, pipeline_cls=pipeline_cls, lpips_fn=lpips_fn,
+        )
 
     print(f"[server] ready. polling every {args.poll_interval}s")
     serve(

@@ -28,7 +28,7 @@ def obs_to_img(obs, variant):
     Convert raw observation to resized image for DSRL actor/critic
     '''
     if variant.env == 'libero':
-        curr_image = obs["agentview_image"][::-1, ::-1]
+        curr_image = obs["agentview_image"][::-1]
     elif variant.env == 'aloha_cube':
         curr_image = obs["pixels"]["top"]
     else:

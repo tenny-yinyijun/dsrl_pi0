@@ -70,19 +70,30 @@ START_FRAME="${START_FRAME:-6}"
 NUM_INFERENCE_STEPS="${NUM_INFERENCE_STEPS:-25}"
 SCORING_MODE="${SCORING_MODE:-spread}"
 
-# WM fine-tuning controls (enabled by default in this script).
-# Updates fire every 20 scored episodes (less often than the 8 we originally
-# had) and each cycle does more work per update (50 grad steps × batch 2)
-# so the WM moves in larger, more stable steps. Combined with
-# WM_CHECKPOINT_EVERY=1 this yields ~1 checkpoint per 20 episodes.
+# WM fine-tuning controls (enabled by default in this script). Cranked up
+# vs the prior conservative defaults — for a 3B-param video model the old
+# settings produced ~100 examples per cycle, which barely moves the
+# weights. New defaults: cycles every 10 episodes (was 20), 200 grad
+# steps per cycle (was 50), batch 4 (was 2), buffer 128 (was 64). That's
+# ~16x more total update work per episode while keeping lr unchanged.
+# Combined with WM_CHECKPOINT_EVERY=1 this yields ~1 checkpoint per 10
+# episodes.
 ENABLE_WM_FINETUNE="${ENABLE_WM_FINETUNE:-1}"
-WM_UPDATE_EVERY="${WM_UPDATE_EVERY:-20}"
-WM_GRAD_STEPS="${WM_GRAD_STEPS:-50}"
-WM_BATCH_SIZE="${WM_BATCH_SIZE:-2}"
+WM_UPDATE_EVERY="${WM_UPDATE_EVERY:-10}"
+WM_GRAD_STEPS="${WM_GRAD_STEPS:-200}"
+WM_BATCH_SIZE="${WM_BATCH_SIZE:-4}"
 WM_LR="${WM_LR:-1e-5}"
 WM_MAX_GRAD_NORM="${WM_MAX_GRAD_NORM:-1.0}"
-WM_BUFFER_SIZE="${WM_BUFFER_SIZE:-64}"
+WM_BUFFER_SIZE="${WM_BUFFER_SIZE:-128}"
 WM_CHECKPOINT_EVERY="${WM_CHECKPOINT_EVERY:-1}"
+
+# WM update sanity-check: render WM rollouts on the K most-recent training
+# trajectories both before and after each fine-tune cycle, and save
+# side-by-side videos to $REWARD_ROOT/wm_update_sanity_check/update_<n>/.
+# Lets you visually verify the WM is actually moving each cycle.
+WM_SANITY_CHECK="${WM_SANITY_CHECK:-1}"
+WM_SANITY_NUM_TRAJS="${WM_SANITY_NUM_TRAJS:-2}"
+WM_SANITY_WINDOWS="${WM_SANITY_WINDOWS:-8}"
 
 # SAC training.
 # MULTI_GRAD_STEP=10 (was 50) — 5× fewer SAC updates per env transition,
@@ -106,8 +117,11 @@ CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-5000}"
 MAX_TRAJS="${MAX_TRAJS:-1000000}"
 MAX_STEPS="${MAX_STEPS:-500000}"
 
-TASK_SUITE="${TASK_SUITE:-libero_90}"
-TASK_ID="${TASK_ID:-57}"
+# TASK_SUITE="${TASK_SUITE:-libero_90}"
+# TASK_ID="${TASK_ID:-57}"
+
+TASK_SUITE="${TASK_SUITE:-libero_goal}"
+TASK_ID="${TASK_ID:-1}"
 
 SERVER_READY_TIMEOUT_S="${SERVER_READY_TIMEOUT_S:-2400}"
 
@@ -157,6 +171,107 @@ LOG_DIR="$REWARD_ROOT/_logs"
 mkdir -p "$LOG_DIR"
 SERVER_LOG="$LOG_DIR/reward_server.log"
 
+# ---------------------------------------------------------------------------
+# Snapshot the experiment config so $REWARD_ROOT is self-describing.
+# Captures every knob this script controls (incl. trainer-side constants)
+# plus git SHAs for reproducibility.
+# ---------------------------------------------------------------------------
+DSRL_GIT_SHA=$(git -C "$DSRL_ROOT" rev-parse HEAD 2>/dev/null || echo "unknown")
+OPEN_WORLD_GIT_SHA=$(git -C "$OPEN_WORLD_ROOT" rev-parse HEAD 2>/dev/null || echo "unknown")
+CONFIG_PATH="$REWARD_ROOT/config.json"
+cat > "$CONFIG_PATH" <<EOF
+{
+  "meta": {
+    "job_tag": "$JOB_TAG",
+    "started_at": "$(date -Iseconds)",
+    "host": "$(hostname)",
+    "script": "$0",
+    "dsrl_git_sha": "$DSRL_GIT_SHA",
+    "open_world_git_sha": "$OPEN_WORLD_GIT_SHA"
+  },
+  "paths": {
+    "dsrl_root": "$DSRL_ROOT",
+    "open_world_root": "$OPEN_WORLD_ROOT",
+    "reward_root": "$REWARD_ROOT",
+    "wm_ckpt": "$WM_CKPT",
+    "wm_dataset_root": "$WM_DATASET_ROOT"
+  },
+  "task": {
+    "task_suite": "$TASK_SUITE",
+    "task_id": $TASK_ID
+  },
+  "policy": {
+    "name": "$POLICY",
+    "query_freq": $QUERY_FREQ,
+    "base_policy_prob": $BASE_POLICY_PROB,
+    "action_magnitude": $ACTION_MAGNITUDE
+  },
+  "wm_scoring": {
+    "scoring_mode": "$SCORING_MODE",
+    "num_passes": $NUM_PASSES,
+    "windows_per_call": $WINDOWS_PER_CALL,
+    "num_windows_legacy": $NUM_WINDOWS,
+    "random_spread": $RANDOM_SPREAD,
+    "start_frame": $START_FRAME,
+    "num_inference_steps": $NUM_INFERENCE_STEPS
+  },
+  "wm_finetune": {
+    "enabled": $ENABLE_WM_FINETUNE,
+    "episodes_per_update": $WM_UPDATE_EVERY,
+    "grad_steps": $WM_GRAD_STEPS,
+    "batch_size": $WM_BATCH_SIZE,
+    "lr": $WM_LR,
+    "max_grad_norm": $WM_MAX_GRAD_NORM,
+    "buffer_size": $WM_BUFFER_SIZE,
+    "checkpoint_every_updates": $WM_CHECKPOINT_EVERY,
+    "sanity_check": {
+      "enabled": $WM_SANITY_CHECK,
+      "num_trajs_per_update": $WM_SANITY_NUM_TRAJS,
+      "windows_per_replay": $WM_SANITY_WINDOWS
+    }
+  },
+  "sac": {
+    "episodes_per_policy_update": $TRAJ_BATCH,
+    "start_online_updates": $START_ONLINE_UPDATES,
+    "multi_grad_step": $MULTI_GRAD_STEP,
+    "checkpoint_interval": $CHECKPOINT_INTERVAL,
+    "batch_size": 256,
+    "discount": 0.999,
+    "seed": 0,
+    "hidden_dims": 128,
+    "resize_image": 64,
+    "eval_interval": 10000,
+    "log_interval": 200,
+    "eval_episodes": 5
+  },
+  "reward_model": {
+    "use_reward_model": 1,
+    "reward_fn": "examples.reward_fn:wm_score",
+    "loss_mode": "$REWARD_LOSS_MODE",
+    "grad_steps": $REWARD_GRAD_STEPS,
+    "lr": $REWARD_LR,
+    "episodes_per_update": $TRAJ_BATCH,
+    "relabel_buffer": 0,
+    "scene_reset_freq": 1
+  },
+  "run_length": {
+    "max_steps": $MAX_STEPS,
+    "max_trajs": $MAX_TRAJS
+  },
+  "video_capture": {
+    "cam_resolution": 256,
+    "fps": 20,
+    "sample_stride": 2,
+    "sample_start_offset": 6
+  },
+  "gpus": {
+    "reward_gpu": $REWARD_GPU,
+    "trainer_gpu": $TRAINER_GPU
+  }
+}
+EOF
+echo "[full] wrote experiment config to $CONFIG_PATH"
+
 echo "[full] DSRL_ROOT=$DSRL_ROOT"
 echo "[full] REWARD_ROOT=$REWARD_ROOT"
 echo "[full] POLICY=$POLICY  QUERY_FREQ=$QUERY_FREQ"
@@ -165,7 +280,8 @@ echo "[full] MULTI_GRAD_STEP=$MULTI_GRAD_STEP  REWARD_GRAD_STEPS=$REWARD_GRAD_ST
 echo "[full] ACTION_MAGNITUDE=$ACTION_MAGNITUDE  BASE_POLICY_PROB=$BASE_POLICY_PROB"
 echo "[full] CHECKPOINT_INTERVAL=$CHECKPOINT_INTERVAL"
 echo "[full] WM ft: enabled=$ENABLE_WM_FINETUNE every=$WM_UPDATE_EVERY"
-echo "[full]        steps=$WM_GRAD_STEPS bs=$WM_BATCH_SIZE lr=$WM_LR"
+echo "[full]        steps=$WM_GRAD_STEPS bs=$WM_BATCH_SIZE lr=$WM_LR  buf=$WM_BUFFER_SIZE"
+echo "[full] WM sanity: enabled=$WM_SANITY_CHECK trajs=$WM_SANITY_NUM_TRAJS windows=$WM_SANITY_WINDOWS"
 nvidia-smi -L | head -4 || true
 
 # ---------------------------------------------------------------------------
@@ -185,6 +301,9 @@ if [ "$ENABLE_WM_FINETUNE" = "1" ]; then
         "--wm-max-grad-norm" "$WM_MAX_GRAD_NORM"
         "--wm-buffer-size" "$WM_BUFFER_SIZE"
         "--wm-checkpoint-every" "$WM_CHECKPOINT_EVERY"
+        "--wm-sanity-check" "$WM_SANITY_CHECK"
+        "--wm-sanity-num-trajs" "$WM_SANITY_NUM_TRAJS"
+        "--wm-sanity-windows" "$WM_SANITY_WINDOWS"
     )
 fi
 
