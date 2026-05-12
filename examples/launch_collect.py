@@ -100,6 +100,16 @@ if __name__ == '__main__':
     parser.add_argument('--max_trajs', default=10**9, type=int)
     parser.add_argument('--task_suite_name', default='libero_90')
     parser.add_argument('--task_id', default=57, type=int)
+    parser.add_argument('--instruction_list', default='',
+                        help='Optional path to a JSON file of pre-generated '
+                             'task instructions (list of strings, or '
+                             "{'instructions': [...]}). When set, each "
+                             "rollout's prompt to π₀ is sampled uniformly "
+                             'from this list instead of using the fixed BDDL '
+                             'task language. Use to multi-task on instruction '
+                             'variations within a single LIBERO scene. '
+                             'Generate the file with '
+                             'examples/scripts/generate_libero_instructions.py.')
     parser.add_argument('--cam_resolution', default=256, type=int)
     parser.add_argument('--fps', default=20, type=int)
     parser.add_argument('--sample_stride', default=2, type=int)

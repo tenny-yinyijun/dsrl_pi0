@@ -30,6 +30,7 @@ import json
 import math
 import os
 import random
+import time
 from typing import Callable, Optional
 
 import jax
@@ -633,6 +634,18 @@ def data_collection_loop(variant, agent, env, eval_env,
             )
             must_reset_after_eval = False
 
+            # Multitask: if an instruction list was loaded
+            # (data_collection_sim.py), sample one for this rollout. The
+            # collect_traj_continuous call reads variant.task_description
+            # for the π₀ prompt, and saves it on the resulting traj so
+            # downstream (annotation.json, WM scoring) picks up the
+            # per-rollout instruction.
+            ilist = getattr(variant, 'instruction_list_data', None) or []
+            if ilist:
+                variant.task_description = str(random.choice(ilist))
+                print(f"[multitask] rollout {num_trajs_collected}: prompt = "
+                      f"{variant.task_description!r}")
+
             traj = collect_traj_continuous(
                 variant, agent, env, i, agent_dp,
                 do_reset=do_reset, carry_obs=last_obs,
@@ -705,6 +718,11 @@ def data_collection_loop(variant, agent, env, eval_env,
                       f'for reward+policy update.')
                 continue
 
+            # Round-boundary block: time reward await + reward grad + SAC grad.
+            _round_t0 = time.perf_counter()
+            _await_dt = 0.0
+            _reward_grad_dt = 0.0
+
             # ----------------------------------------------------------- #
             # Reward-model batch update (optional)
             # ----------------------------------------------------------- #
@@ -747,12 +765,15 @@ def data_collection_loop(variant, agent, env, eval_env,
                             f'{n_total} traj(s) from reward server '
                             f'({mode_str} mode).', flush=True
                         )
+                    _await_t0 = time.perf_counter()
                     targets = np.array(
                         [float(gather_fn(t)) for t in scored_trajs],
                         dtype=np.float32)
+                    _await_dt = time.perf_counter() - _await_t0
                     print(f'[reward] f-scores: mean={targets.mean():.4f} '
                           f'std={targets.std():.4f} min={targets.min():.4f} '
-                          f'max={targets.max():.4f}')
+                          f'max={targets.max():.4f}  '
+                          f'await={_await_dt:.2f}s')
 
                 # Choose loss mode. 'per_step' uses per-WM-frame LPIPS as
                 # masked per-(query-step) targets; 'traj' uses the legacy
@@ -782,9 +803,11 @@ def data_collection_loop(variant, agent, env, eval_env,
                 last_info = {}
                 if (loss_mode == 'per_step' and per_step_targets is not None
                         and n_scored > 0):
+                    _reward_grad_t0 = time.perf_counter()
                     for _ in range(int(variant.reward_grad_steps)):
                         last_info = reward_learner.update_per_step(
                             scored_trajs, per_step_targets, per_step_masks)
+                    _reward_grad_dt = time.perf_counter() - _reward_grad_t0
                     cov_mean = float(np.mean(coverage)) if coverage else 0.0
                     wandb_logger.log({
                         'reward_model/loss': last_info.get('reward_model/loss', 0.0),
@@ -803,8 +826,10 @@ def data_collection_loop(variant, agent, env, eval_env,
                         'reward_model/loss_mode': 1.0,  # 1.0 = per_step
                     }, step=i)
                 elif n_scored > 0:
+                    _reward_grad_t0 = time.perf_counter()
                     for _ in range(int(variant.reward_grad_steps)):
                         last_info = reward_learner.update(scored_trajs, targets)
+                    _reward_grad_dt = time.perf_counter() - _reward_grad_t0
                     wandb_logger.log({
                         'reward_model/loss': last_info.get('reward_model/loss', 0.0),
                         'reward_model/pred_return_mean': last_info.get('reward_model/pred_return_mean', 0.0),
@@ -907,8 +932,15 @@ def data_collection_loop(variant, agent, env, eval_env,
             pending_trajs = []
 
             if len(online_replay_buffer) <= variant.start_online_updates:
+                _round_dt = time.perf_counter() - _round_t0
+                print(f'[round-time] await={_await_dt:.2f}s '
+                      f'reward_grad={_reward_grad_dt:.2f}s '
+                      f'sac=skipped(warmup buffer={len(online_replay_buffer)}'
+                      f'<={variant.start_online_updates}) '
+                      f'total={_round_dt:.2f}s', flush=True)
                 continue
 
+            _sac_t0 = time.perf_counter()
             for _ in range(gradsteps_acc):
                 if i == 0:
                     print('performing evaluation for initial checkpoint')
@@ -960,3 +992,10 @@ def data_collection_loop(variant, agent, env, eval_env,
                         and i % variant.checkpoint_interval == 0):
                     agent.save_checkpoint(variant.outputdir, i,
                                           variant.checkpoint_interval)
+
+            _sac_dt = time.perf_counter() - _sac_t0
+            _round_dt = time.perf_counter() - _round_t0
+            print(f'[round-time] await={_await_dt:.2f}s '
+                  f'reward_grad={_reward_grad_dt:.2f}s '
+                  f'sac={_sac_dt:.2f}s(steps={gradsteps_acc}) '
+                  f'total={_round_dt:.2f}s', flush=True)

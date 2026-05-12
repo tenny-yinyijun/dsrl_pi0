@@ -5,6 +5,7 @@ Mirrors ``examples.train_sim`` but plugs in ``data_collection_loop`` from
 ``examples.train_utils_collect``. Adds knobs for scene-reset frequency (X),
 reward+policy update frequency (Y), and on-disk libero_processed saving.
 """
+import json
 import os
 
 # Match train_sim.py: enable Triton GEMM before importing jax.
@@ -93,6 +94,33 @@ def main(variant):
         variant.bddl_name = pathlib.Path(task.bddl_file).stem
         variant.env_max_reward = 1
         variant.max_timesteps = 400
+
+        # Optional: load a pre-generated instruction list (multitask
+        # variant). Each rollout's prompt to π₀ will be sampled uniformly
+        # from this list — see train_utils_collect.data_collection_loop
+        # where variant.task_description is overwritten before each call
+        # to collect_traj_continuous.
+        instruction_list_path = getattr(variant, 'instruction_list', '') or ''
+        if instruction_list_path:
+            with open(instruction_list_path) as f:
+                _ilist_raw = json.load(f)
+            if isinstance(_ilist_raw, dict) and 'instructions' in _ilist_raw:
+                _instructions = list(_ilist_raw['instructions'])
+            elif isinstance(_ilist_raw, list):
+                _instructions = list(_ilist_raw)
+            else:
+                raise ValueError(
+                    f"--instruction_list {instruction_list_path}: expected a "
+                    f"JSON list or an object with key 'instructions'.")
+            if not _instructions:
+                raise ValueError(
+                    f"--instruction_list {instruction_list_path} contains no "
+                    f"instructions.")
+            variant.instruction_list_data = _instructions
+            print(f'[multitask] loaded {len(_instructions)} instructions from '
+                  f'{instruction_list_path}; per-rollout prompt sampling enabled.')
+        else:
+            variant.instruction_list_data = []
     elif variant.env == 'aloha_cube':
         from gymnasium.envs.registration import register
         register(

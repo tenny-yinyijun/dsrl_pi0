@@ -101,12 +101,12 @@ REWARD_LOSS_MODE=per_step
 # WM scoring
 # ----------------------------------------------------------------------------
 SCORING_MODE=spread
-NUM_PASSES=5
-WINDOWS_PER_CALL=1
+NUM_PASSES=2               # 2 autoregressive rollouts per traj (samples)
+WINDOWS_PER_CALL=3         # each rollout = 3 autoregressive windows = 12 predicted frames
 RANDOM_SPREAD=1
 START_FRAME=6
 NUM_INFERENCE_STEPS=50
-NUM_WINDOWS=5
+NUM_WINDOWS=6              # = NUM_PASSES × WINDOWS_PER_CALL (kept for legacy code paths)
 
 # ----------------------------------------------------------------------------
 # GPU layout
@@ -147,8 +147,10 @@ fi
 
 # SAC checkpoint cadence — target one ckpt every 200 trajs.
 # Per-traj SAC update count ≈ transitions/traj × multi_grad_step.
-# transitions/traj ≈ 400 native frames / QUERY_FREQ.
-TRANSITIONS_PER_TRAJ=$(( 400 / QUERY_FREQ ))
+# transitions/traj ≈ ~100 env steps / QUERY_FREQ. Empirically trajs
+# terminate well before the 400-step LIBERO cap (see slurm log: ~93
+# env steps/traj observed), so a 100-step estimate matches reality.
+TRANSITIONS_PER_TRAJ=$(( 100 / QUERY_FREQ ))
 SAC_CKPT_TRAJS=200
 CHECKPOINT_INTERVAL=$(( SAC_CKPT_TRAJS * TRANSITIONS_PER_TRAJ * MULTI_GRAD_STEP ))
 
