@@ -176,6 +176,41 @@ def wm_score_request(traj) -> str:
     return p["eid"]
 
 
+def wm_score_request_wm_only(traj) -> str:
+    """Drop a `.wm_only` marker for the trajectory; do NOT block.
+
+    Asks the reward server to encode the trajectory's latents and add it
+    to its WM fine-tune buffer WITHOUT scoring it. No `.score.json` will
+    be written, no LPIPS rollout will be performed, and the trainer must
+    NOT call ``wm_score_await`` for this eid. Use this for trajectories
+    that the trainer wants to feed the WM but doesn't need a reward
+    target for (i.e. the unscored fraction under --score_prob < 1.0).
+
+    Note the marker uses extension ``.wm_only`` (NOT ``.wm_only.req``) so
+    it doesn't collide with the server's ``*.req`` glob.
+
+    Idempotent in the same way as ``wm_score_request``.
+    """
+    p = _wm_paths(traj)
+    os.makedirs(p["requests_dir"], exist_ok=True)
+    if not os.path.exists(p["ann_path"]):
+        raise RuntimeError(
+            f"wm_score_request_wm_only: annotation not found at {p['ann_path']}")
+    wm_only_req = os.path.join(p["requests_dir"], f"{p['eid']}.wm_only")
+    # If it's already been scored or a normal request is already pending,
+    # there's nothing to do — the WM buffer add will happen via the
+    # scoring path in either case.
+    if os.path.exists(p["score_path"]) or os.path.exists(p["err_path"]):
+        return p["eid"]
+    if os.path.exists(p["req_path"]) or os.path.exists(wm_only_req):
+        return p["eid"]
+    tmp = wm_only_req + ".tmp"
+    with open(tmp, "w") as f:
+        f.write("")
+    os.replace(tmp, wm_only_req)
+    return p["eid"]
+
+
 def wm_score_await(traj) -> float:
     """Block until the score for ``traj`` is ready; return the scalar.
 

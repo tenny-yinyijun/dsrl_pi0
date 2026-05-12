@@ -146,7 +146,7 @@ def main(variant):
     print("Loaded pi0 policy from %s", checkpoint_dir)
     agent = PixelSACLearner(variant.seed, sample_obs, sample_action, **kwargs)
 
-    online_buffer_size = variant.max_steps // variant.multi_grad_step
+    online_buffer_size = variant.max_steps // max(variant.multi_grad_step, 1)
     online_replay_buffer = ReplayBuffer(
         dummy_env.observation_space, dummy_env.action_space,
         int(online_buffer_size))
@@ -156,6 +156,7 @@ def main(variant):
     score_fn = None
     score_fn_request = None
     score_fn_await = None
+    score_fn_request_wm_only = None
     if int(getattr(variant, 'use_reward_model', 0)):
         spec = variant.reward_fn
         if ':' not in spec:
@@ -173,6 +174,12 @@ def main(variant):
         if score_fn_request is None or score_fn_await is None:
             score_fn_request = None
             score_fn_await = None
+        # Optional 'wm-only' sibling. When present and --scored_per_round
+        # < round_size, the unscored fraction of trajectories drops
+        # .wm_only markers so the server still adds them to its WM
+        # fine-tune buffer without paying the LPIPS-rollout cost.
+        score_fn_request_wm_only = getattr(
+            _mod, attr + '_request_wm_only', None)
         reward_kwargs = dict(
             hidden_dims=kwargs.get('hidden_dims', (128, 128, 128)),
             cnn_features=kwargs.get('cnn_features', (32, 32, 32, 32)),
@@ -218,5 +225,6 @@ def main(variant):
         reward_learner=reward_learner, score_fn=score_fn,
         score_fn_request=score_fn_request,
         score_fn_await=score_fn_await,
+        score_fn_request_wm_only=score_fn_request_wm_only,
         encoder=encoder,
     )

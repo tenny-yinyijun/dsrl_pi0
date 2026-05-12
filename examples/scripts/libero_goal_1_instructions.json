@@ -1,0 +1,41 @@
+{
+  "task_suite": "libero_goal",
+  "task_id": 1,
+  "bddl": "put_the_bowl_on_the_stove.bddl",
+  "base_language": "put the bowl on the stove",
+  "vlm_model": "gpt-5-mini",
+  "objects": [
+    "top drawer of the cabinet",
+    "bottom drawer of the cabinet",
+    "top of the cabinet",
+    "black bowl",
+    "plate",
+    "rack",
+    "wine bottle",
+    "stove",
+    "butter"
+  ],
+  "num_instructions": 20,
+  "instructions": [
+    "Open the top drawer of the cabinet",
+    "Close the top drawer of the cabinet",
+    "Open the bottom drawer of the cabinet",
+    "Close the bottom drawer of the cabinet",
+    "Pick up the wine bottle",
+    "Put the wine bottle on top of the cabinet",
+    "Place the black bowl on the rack",
+    "Put the plate on top of the cabinet",
+    "Put the butter on the plate",
+    "Put the butter inside the bottom drawer of the cabinet",
+    "Put the black bowl inside the top drawer of the cabinet",
+    "Put the rack next to the stove",
+    "Put the plate next to the black bowl",
+    "Put the wine bottle on the rack",
+    "Turn on the stove",
+    "Put the plate in front of the stove",
+    "Move the black bowl to the top of the cabinet",
+    "Pick up the butter",
+    "Put the wine bottle next to the butter",
+    "Put the rack on top of the cabinet"
+  ]
+}

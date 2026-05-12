@@ -52,6 +52,7 @@ from typing import Optional
 
 import numpy as np
 import torch
+from tqdm.auto import tqdm
 
 
 OPEN_WORLD_ROOT = Path(
@@ -65,6 +66,7 @@ from score_traj import (  # noqa: E402
     _load_stat,
     build_model,
     decode_latents_rgb,
+    load_full_episode,
     lpips_per_frame,
     score_episode,
     stack_cams,
@@ -101,11 +103,15 @@ def _load_or_encode_latents(
     device: torch.device,
     eid: str,
 ) -> torch.Tensor:
-    """Return per-cam latents (T, num_cams, 4, h, w) float32 (CPU).
+    """Return per-cam latents (T, num_cams, 4, h, w) float32 (CPU) at NATIVE 20 Hz.
 
-    If the annotation already references ``latent_videos``, just load them.
-    Otherwise read ``raw_videos`` mp4s with decord, resize to (cfg.height,
-    cfg.width), VAE-encode, save to disk, and update the annotation.
+    The WM was trained with latents at native 20 Hz (T_latent == T_state) and
+    accesses them via ``rgb_id`` directly. ``cfg.down_sample`` is *only* the
+    action stride (``state_id = rgb_id * down_sample``), not a latent stride —
+    see ``open-world/scripts/preprocess_libero_for_wm.py`` (encodes every raw
+    frame) and ``open-world/scripts/replay_libero_wm_traj.py`` (the official
+    replay convention). Striding latents here would push inputs out of the
+    WM's training distribution.
     """
     cam_specs = annotation.get("latent_videos") or []
     if len(cam_specs) >= cfg.num_cams:
@@ -284,15 +290,20 @@ class WMFineTuner:
             for p in mod.parameters():
                 p.requires_grad = False
 
+        # weight_decay=0 for fine-tuning: the pretrained backbone is already
+        # well-trained, and AdamW's decoupled decay would slowly shrink those
+        # weights toward zero across cycles, eroding generation quality.
         self.optimizer = torch.optim.AdamW(
             self.trainable_params, lr=args.wm_lr, betas=(0.9, 0.999),
-            weight_decay=0.01,
+            weight_decay=0.0,
         )
+        self.skip_his = int(getattr(args, "skip_his", 4))
         self.update_every = int(args.wm_update_every)
         self.grad_steps = int(args.wm_grad_steps)
         self.batch_size = int(args.wm_batch_size)
         self.max_grad_norm = float(args.wm_max_grad_norm)
         self.buffer_max = int(args.wm_buffer_size)
+        self.buffer_freeze_at = int(getattr(args, "wm_buffer_freeze_at", 0))
         self.checkpoint_every = int(args.wm_checkpoint_every)
 
         self.ckpt_dir = Path(args.reward_root) / "wm_checkpoints"
@@ -326,6 +337,33 @@ class WMFineTuner:
         self.cycles_done = 0
         self.scored_since_update = 0
 
+        # ---- Pretrain-replay buffer (anti-catastrophic-forgetting) ----
+        # When the online buffer is small (e.g. the overfit harness uses 2
+        # trajs), pure-online fine-tuning drifts off the base manifold —
+        # the optimizer trades general capability for memorizing the 2
+        # trajs. Mixing in pretrain windows acts as a soft anchor: at each
+        # gradient step a fraction (1 - mix_online) of the batch is drawn
+        # from a CPU buffer of pretrain trajectories, so any move that
+        # damages pretrain loss gets penalized.
+        self.pretrain_buffer: list = []
+        self.mix_online = float(getattr(args, "wm_mix_online", 1.0))
+        self.mix_online = max(0.0, min(1.0, self.mix_online))
+        pretrain_root = getattr(args, "wm_pretrain_root", "") or ""
+        pretrain_suite = getattr(args, "wm_pretrain_suite", "") or ""
+        n_pretrain = int(getattr(args, "wm_pretrain_num_trajs", 0) or 0)
+        if pretrain_root and pretrain_suite and n_pretrain > 0 and self.mix_online < 1.0:
+            self.pretrain_buffer = self._load_pretrain_buffer(
+                pretrain_root=Path(pretrain_root),
+                suite=pretrain_suite,
+                num_trajs=n_pretrain,
+                seed=int(getattr(args, "wm_pretrain_seed", 0) or 0),
+            )
+            print(f"[wm-ft] pretrain mix on: root={pretrain_root}  "
+                  f"suite={pretrain_suite}  n={len(self.pretrain_buffer)}  "
+                  f"mix_online={self.mix_online}")
+        else:
+            print(f"[wm-ft] pretrain mix off (mix_online={self.mix_online})")
+
         n_train = sum(p.numel() for p in self.trainable_params)
         print(f"[wm-ft] trainable params: {n_train/1e6:.2f}M  "
               f"buffer_max={self.buffer_max}  update_every={self.update_every}  "
@@ -336,8 +374,49 @@ class WMFineTuner:
                   f"windows={self.sanity_windows}  "
                   f"start_frame={self.sanity_start_frame}  dir={self.sanity_dir}")
 
+    def _load_pretrain_buffer(self, *, pretrain_root: Path, suite: str,
+                              num_trajs: int, seed: int) -> list:
+        """Eagerly load up to ``num_trajs`` random pretrain trajectories
+        into CPU memory in the same tuple format as ``self.buffer``.
+
+        Each entry: (latents_per_cam fp32 CPU, actions fp32 CPU, text, eid).
+        Failures on individual episodes are logged and skipped.
+        """
+        suite_root = pretrain_root / suite
+        ann_dir = suite_root / getattr(self.cfg, "annotation_name", "annotation") / "train"
+        if not ann_dir.exists():
+            print(f"[wm-ft] WARN: pretrain annotation dir missing: {ann_dir}")
+            return []
+        all_eids = sorted(p.stem for p in ann_dir.glob("*.json"))
+        if not all_eids:
+            print(f"[wm-ft] WARN: no pretrain eids under {ann_dir}")
+            return []
+        rng = np.random.default_rng(seed)
+        chosen = list(rng.choice(all_eids,
+                                 size=min(num_trajs, len(all_eids)),
+                                 replace=False))
+        buf: list = []
+        for eid in chosen:
+            try:
+                latents, actions, text = load_full_episode(
+                    self.cfg, suite, str(eid), pretrain_root)
+                buf.append((latents.detach().to("cpu", torch.float32),
+                            actions.detach().to("cpu", torch.float32),
+                            text, f"PT::{suite}/{eid}"))
+            except Exception as e:
+                print(f"[wm-ft] pretrain load failed for {suite}/{eid}: {e}")
+        return buf
+
     def add_sample(self, latents_per_cam, actions, text, eid=""):
-        """Buffer a freshly-scored trajectory for later training."""
+        """Buffer a freshly-scored trajectory for later training.
+
+        If the buffer is frozen (--wm-buffer-freeze-at), drop the sample
+        but still tick the update counter so subsequent fine-tune cycles
+        keep firing on the existing (frozen) contents.
+        """
+        if self.buffer_freeze_at > 0 and len(self.buffer) >= self.buffer_freeze_at:
+            self.scored_since_update += 1
+            return
         self.buffer.append(
             (latents_per_cam.detach().to("cpu", torch.float32),
              actions.detach().to("cpu", torch.float32),
@@ -346,29 +425,54 @@ class WMFineTuner:
         self.scored_since_update += 1
 
     def _sample_window(self, latents_per_cam, actions, text):
-        """Pick a random (num_history + num_frames)-length window and stack
-        cameras vertically, matching what LiberoLatentDataset returns.
+        """Pick a (num_history + num_frames)-length window with the SAME
+        temporal layout used by LiberoLatentDataset._build_frame_ids (i.e.
+        pretraining) and by score_episode (inference). Specifically:
+        history frames spaced by ``skip_his = skip*4`` native frames
+        (skip ∈ {1,2}, with 15% chance of skip_his=0), future frames spaced
+        by ``skip``.
+
+        Earlier versions sampled F *consecutive* native frames, which is
+        skip=1/skip_his=1 — a layout the WM has never seen and is opposite
+        to what score_episode renders (skip_his=4). Training on that layout
+        and then evaluating with skip_his=4 leaves predictions unchanged
+        even after thousands of grad steps.
 
         latents_per_cam: (T, num_cams, 4, h, w)
-        actions:         (T, action_dim)
+        actions:         (T, action_dim)  — already strided to align with
+                         the latent's index space (see _load_actions).
         Returns dict with 'latent' (1,F,4,total_h,w), 'action' (1,F,A), 'text'.
         """
         cfg = self.cfg
-        F = cfg.num_history + cfg.num_frames
-        T = latents_per_cam.shape[0]
-        if T < F:
-            # Pad by repeating last frame.
-            pad = F - T
-            latents_per_cam = torch.cat(
-                [latents_per_cam,
-                 latents_per_cam[-1:].expand(pad, -1, -1, -1, -1)], dim=0)
-            actions = torch.cat(
-                [actions, actions[-1:].expand(pad, -1)], dim=0)
-            T = F
-        start = int(np.random.randint(0, T - F + 1))
-        lat_win = latents_per_cam[start : start + F]   # (F, num_cams, 4, h, w)
-        act_win = actions[start : start + F]           # (F, A)
-        # Stack cams along H -> (F, 4, num_cams*h, w)
+        T = int(latents_per_cam.shape[0])
+
+        skip = int(np.random.randint(1, 3))      # {1, 2}
+        skip_his = skip * 4
+        if np.random.random() < 0.15:
+            skip_his = 0
+
+        # frame_now is the "current" index; history at frame_now - i*skip_his,
+        # future at frame_now + i*skip. Pick frame_now so the whole window
+        # fits in [0, T-1] without clipping when possible; otherwise we clip
+        # below (matches dataset.py's np.clip behavior).
+        min_now = cfg.num_history * skip_his
+        max_now = T - 1 - (cfg.num_frames - 1) * skip
+        if max_now <= min_now:
+            frame_now = max(0, min(T - 1, (min_now + max_now) // 2))
+        else:
+            frame_now = int(np.random.randint(min_now, max_now + 1))
+
+        rgb_id = []
+        for i in range(cfg.num_history, 0, -1):
+            rgb_id.append(frame_now - i * skip_his)
+        rgb_id.append(frame_now)
+        for i in range(1, cfg.num_frames):
+            rgb_id.append(frame_now + i * skip)
+        rgb_id = [max(0, min(T - 1, x)) for x in rgb_id]
+        idx = torch.as_tensor(rgb_id, dtype=torch.long)
+
+        lat_win = latents_per_cam.index_select(0, idx)  # (F, num_cams, 4, h, w)
+        act_win = actions.index_select(0, idx)          # (F, A)
         lat_stacked = torch.cat(
             [lat_win[:, m] for m in range(lat_win.shape[1])], dim=-2)
         return {
@@ -387,7 +491,18 @@ class WMFineTuner:
         if len(self.buffer) == 0:
             self.scored_since_update = 0
             return None
+        return self._run_cycle()
 
+    def force_step(self):
+        """Run a cycle unconditionally (bypass the scored_since_update gate).
+
+        Used by the server's --wm-self-loop mode so cycles keep firing on a
+        frozen buffer once the trainer has stopped collecting."""
+        if len(self.buffer) == 0:
+            return None
+        return self._run_cycle()
+
+    def _run_cycle(self):
         # Pick the K most-recent buffer entries as the sanity-check fixtures
         # (these are the trajectories most likely to drive this cycle's
         # gradients — the K most recently appended scored episodes).
@@ -397,6 +512,13 @@ class WMFineTuner:
             sanity_targets = list(self.buffer)[-k:]
         else:
             sanity_targets = []
+
+        print(
+            f"[wm-ft] cycle={cycle_id} START  grad_steps={self.grad_steps}  "
+            f"bs={self.batch_size}  buf={len(self.buffer)}  "
+            f"sanity_trajs={len(sanity_targets)}",
+            flush=True,
+        )
 
         before_renders = self._render_sanity(sanity_targets) if sanity_targets else []
 
@@ -411,19 +533,41 @@ class WMFineTuner:
                 mod.eval()
 
         losses = []
+        n_online_total = 0
+        n_pretrain_total = 0
         t0 = time.perf_counter()
-        for k in range(self.grad_steps):
+        have_pretrain = len(self.pretrain_buffer) > 0 and self.mix_online < 1.0
+        # mininterval=2 keeps the log readable when stderr is redirected to
+        # a file (one progress line every ~2s). dynamic_ncols=False so the
+        # bar width is stable across writes (matters for tail -f).
+        pbar = tqdm(
+            range(self.grad_steps),
+            desc=f"[wm-ft] cycle={cycle_id}",
+            dynamic_ncols=False, ncols=100,
+            mininterval=2.0, leave=True,
+        )
+        for k in pbar:
             self.optimizer.zero_grad(set_to_none=True)
 
-            # Sample a batch of B (window) dicts and stack.
+            # Sample a batch of B (window) dicts and stack. Each window in
+            # the batch is independently drawn from online or pretrain
+            # buffer (Bernoulli with p=mix_online). With mix_online=1.0 or
+            # an empty pretrain buffer, this reduces to the legacy
+            # online-only behavior.
             batch_lat, batch_act, batch_txt = [], [], []
             for _ in range(self.batch_size):
-                idx = int(np.random.randint(0, len(self.buffer)))
-                lat, act, txt, _eid = self.buffer[idx]
+                use_pretrain = have_pretrain and (np.random.random() >= self.mix_online)
+                src = self.pretrain_buffer if use_pretrain else self.buffer
+                idx = int(np.random.randint(0, len(src)))
+                lat, act, txt, _eid = src[idx]
                 w = self._sample_window(lat, act, txt)
                 batch_lat.append(w["latent"])
                 batch_act.append(w["action"])
                 batch_txt.append(w["text"][0])
+                if use_pretrain:
+                    n_pretrain_total += 1
+                else:
+                    n_online_total += 1
 
             # The model's unet / action_encoder are bf16 (cast in
             # score_traj.build_model). Buffer storage is fp32 on CPU for
@@ -449,6 +593,11 @@ class WMFineTuner:
             self.optimizer.step()
             self.global_step += 1
             losses.append(float(loss.detach().to("cpu", torch.float32).item()))
+            # Show running mean over the last ~10% as the bar's loss field.
+            window = losses[-max(10, self.grad_steps // 10):]
+            pbar.set_postfix({"loss": f"{float(np.mean(window)):.4f}"},
+                             refresh=False)
+        pbar.close()
 
         self.model.eval()
         self.scored_since_update = 0
@@ -467,12 +616,19 @@ class WMFineTuner:
             "global_step": self.global_step,
             "cycles_done": self.cycles_done,
             "buffer_size": len(self.buffer),
+            "pretrain_buffer_size": len(self.pretrain_buffer),
+            "mix_online": self.mix_online,
+            "n_online_windows": n_online_total,
+            "n_pretrain_windows": n_pretrain_total,
             "elapsed_s": elapsed,
         }
         print(
-            f"[wm-ft] cycle={self.cycles_done}  step={self.global_step}  "
+            f"[wm-ft] cycle={self.cycles_done} DONE  step={self.global_step}  "
             f"loss {losses[0]:.4f} -> {losses[-1]:.4f} (mean {info['loss_mean']:.4f})  "
-            f"buf={len(self.buffer)}  elapsed={elapsed:.1f}s"
+            f"buf={len(self.buffer)}  pt_buf={len(self.pretrain_buffer)}  "
+            f"online/pt={n_online_total}/{n_pretrain_total}  "
+            f"elapsed={elapsed:.1f}s",
+            flush=True,
         )
 
         # Save checkpoint.
@@ -502,7 +658,10 @@ class WMFineTuner:
         and return [(eid, pred_rgb, gt_rgb), ...]. Failures are logged and
         skipped — this is best-effort instrumentation."""
         out = []
-        skip_his = int(getattr(self.cfg, "num_history", 4))
+        # Match the training-time stride: dataset.py uses `skip_his = skip*4`
+        # with `skip ∈ {1,2}`, i.e. {4, 8} native-rate frames between history
+        # points. The official replay script picks `skip=1` ⇒ skip_his=4.
+        skip_his = self.skip_his
         for lat, act, txt, eid in targets:
             try:
                 with torch.no_grad():
@@ -600,6 +759,20 @@ def _spread_start_frames(start_frame: int, num_passes: int,
     return [int(s) for s in starts]
 
 
+def _try_claim(req: Path, worker_tag: str) -> Optional[Path]:
+    """Atomically claim a request file by renaming it with a worker-specific
+    suffix. Returns the claimed path on success, None if another worker grabbed
+    it first (or it was deleted). POSIX rename is atomic, so this is safe
+    even when N reward_server processes share the same request directory.
+    """
+    claimed = req.with_name(req.name + f".taken-{worker_tag}")
+    try:
+        req.rename(claimed)
+        return claimed
+    except (FileNotFoundError, OSError):
+        return None
+
+
 def serve(args, cfg, model, pipeline, pipeline_cls, lpips_fn, device,
           dataset_root, finetuner=None):
     reward_root = Path(args.reward_root)
@@ -607,6 +780,10 @@ def serve(args, cfg, model, pipeline, pipeline_cls, lpips_fn, device,
     scores_dir = reward_root / "scores"
     requests_dir.mkdir(parents=True, exist_ok=True)
     scores_dir.mkdir(parents=True, exist_ok=True)
+
+    # Worker tag: identifies *this* server instance when multiple processes
+    # share the same request directory (multi-GPU scoring). Defaults to PID.
+    worker_tag = str(getattr(args, "worker_id", "") or os.getpid())
 
     save_preds = bool(args.save_wm_predictions)
     pred_every = max(1, int(args.wm_predictions_every))
@@ -635,25 +812,116 @@ def serve(args, cfg, model, pipeline, pipeline_cls, lpips_fn, device,
     rng = np.random.default_rng(int(args.spread_seed)
                                 if args.spread_seed is not None else None)
 
-    print(f"[server] scoring_mode={scoring_mode}  num_passes={num_passes}  "
+    print(f"[server:{worker_tag}] scoring_mode={scoring_mode}  num_passes={num_passes}  "
           f"windows_per_call={windows_per_call}  random_spread={random_spread}  "
           f"start_frame={args.start_frame}  num_windows(legacy)={args.num_windows}")
-    print(f"[server] watching {requests_dir} ; writing to {scores_dir}")
+    print(f"[server:{worker_tag}] watching {requests_dir} ; writing to {scores_dir}")
 
     served = 0
+    wm_only_added = 0
     while True:
+        # Two kinds of requests live in the same directory:
+        #   <eid>.req      -> score + add to WM finetune buffer (full path)
+        #   <eid>.wm_only  -> add to WM finetune buffer ONLY (no scoring)
+        # Score requests have priority so the trainer never blocks on
+        # wm-only work.
+        #
+        # Multi-worker safety: when several reward_server processes share
+        # this directory (multi-GPU scoring), each request must be claimed
+        # via an atomic rename before processing. _try_claim handles the
+        # race; on success it returns the new <name>.taken-<worker> path,
+        # on failure another worker got it and we keep looking.
         reqs = sorted(p for p in requests_dir.glob("*.req") if p.is_file())
-        if not reqs:
-            time.sleep(args.poll_interval)
+        wm_only_reqs = sorted(p for p in requests_dir.glob("*.wm_only")
+                              if p.is_file())
+
+        # Try to claim a score request first (priority over wm_only).
+        claimed_req = None
+        eid = None
+        for r in reqs:
+            cand_eid = r.stem
+            score_path = scores_dir / f"{cand_eid}.score.json"
+            if score_path.exists():
+                # Already scored elsewhere — best-effort cleanup, don't
+                # bother claiming. unlink may race with another worker;
+                # missing_ok=True absorbs that.
+                r.unlink(missing_ok=True)
+                continue
+            c = _try_claim(r, worker_tag)
+            if c is not None:
+                claimed_req = c
+                eid = cand_eid
+                break
+
+        if claimed_req is None:
+            # No score work for us. Try wm_only.
+            claimed_wm = None
+            wm_eid = None
+            for r in wm_only_reqs:
+                c = _try_claim(r, worker_tag)
+                if c is not None:
+                    claimed_wm = c
+                    wm_eid = r.stem
+                    break
+
+            if claimed_wm is None:
+                # Nothing claimable this iteration.
+                #
+                # Self-loop: when nothing is pending, fire another fine-tune
+                # cycle on the existing (frozen) buffer. Used by the overfit
+                # harness after the trainer has exited.
+                if (getattr(args, "wm_self_loop", False)
+                        and finetuner is not None
+                        and len(finetuner.buffer) > 0
+                        and (finetuner.buffer_freeze_at <= 0
+                             or len(finetuner.buffer) >= finetuner.buffer_freeze_at)):
+                    finetuner.force_step()
+                    continue
+                time.sleep(args.poll_interval)
+                continue
+
+            # ----------------------------------------------------------- #
+            # WM-only branch (fast path: encode latents, add to buffer,
+            # skip the LPIPS rollout entirely).
+            # ----------------------------------------------------------- #
+            try:
+                if finetuner is None:
+                    # No finetuner configured — nothing to do; just
+                    # remove the claim so the directory doesn't grow.
+                    claimed_wm.unlink(missing_ok=True)
+                    continue
+                t0 = time.perf_counter()
+                traj_dir, annotation, _split = _resolve_traj_dir(
+                    reward_root, wm_eid)
+                latents_per_cam = _load_or_encode_latents(
+                    traj_dir=traj_dir, annotation=annotation, cfg=cfg,
+                    pipeline=pipeline, device=device, eid=wm_eid,
+                )
+                T_wm = latents_per_cam.shape[0]
+                actions = _load_actions(
+                    annotation, cfg, traj_dir, dataset_root, T_wm)
+                text = (
+                    annotation["texts"][0]
+                    if annotation.get("texts")
+                    else annotation.get("language_instruction", "")
+                )
+                finetuner.add_sample(latents_per_cam, actions, text, wm_eid)
+                finetuner.maybe_step()
+                claimed_wm.unlink(missing_ok=True)
+                wm_only_added += 1
+                elapsed = time.perf_counter() - t0
+                print(f"[server:{worker_tag}] [wm_only {wm_only_added:5d}] "
+                      f"eid={wm_eid}  added to WM buffer "
+                      f"(no scoring)  elapsed={elapsed:.2f}s  T_wm={T_wm}")
+            except Exception:
+                tb = traceback.format_exc()
+                print(f"[server:{worker_tag}] ERROR adding wm_only {wm_eid}:\n{tb}")
+                claimed_wm.unlink(missing_ok=True)
             continue
 
-        req = reqs[0]
-        eid = req.stem
+        # We have a claimed score request. The original path is gone (it
+        # was renamed to claimed_req); from here on, operate on claimed_req.
         score_path = scores_dir / f"{eid}.score.json"
-        if score_path.exists():
-            # Already scored — clean up the stale request.
-            req.unlink(missing_ok=True)
-            continue
 
         try:
             t0 = time.perf_counter()
@@ -779,12 +1047,12 @@ def serve(args, cfg, model, pipeline, pipeline_cls, lpips_fn, device,
                     )
                     payload.update(pred_meta)
                 except Exception as e:
-                    print(f"[server] WARN: failed to save WM predictions for {eid}: {e}")
+                    print(f"[server:{worker_tag}] WARN: failed to save WM predictions for {eid}: {e}")
             _atomic_write_json(score_path, payload)
-            req.unlink(missing_ok=True)
+            claimed_req.unlink(missing_ok=True)
             served += 1
             print(
-                f"[server] [{served:5d}] eid={eid}  score={score:.4f}  "
+                f"[server:{worker_tag}] [{served:5d}] eid={eid}  score={score:.4f}  "
                 f"windows={windows_completed_total}  passes={len(start_positions)}  "
                 f"elapsed={elapsed:.2f}s  T_wm={T_wm}"
             )
@@ -795,13 +1063,13 @@ def serve(args, cfg, model, pipeline, pipeline_cls, lpips_fn, device,
         except Exception:
             err_path = scores_dir / f"{eid}.error.json"
             tb = traceback.format_exc()
-            print(f"[server] ERROR scoring {eid}:\n{tb}")
+            print(f"[server:{worker_tag}] ERROR scoring {eid}:\n{tb}")
             try:
                 _atomic_write_json(
                     err_path, {"eid": eid, "error": tb, "wm_ckpt": args.ckpt_path}
                 )
             finally:
-                req.unlink(missing_ok=True)
+                claimed_req.unlink(missing_ok=True)
 
 
 def _maybe_step(ckpt_path: str) -> Optional[int]:
@@ -869,6 +1137,13 @@ def main() -> None:
     parser.add_argument("--num-inference-steps", type=int, default=0)
     parser.add_argument("--poll-interval", type=float, default=0.25)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--worker-id", default="",
+                        help="Optional stable tag for this server instance, "
+                             "used in log lines and as the suffix on "
+                             "atomic-claim renames (<eid>.req.taken-<worker>). "
+                             "Set this when launching multiple reward_server "
+                             "processes against the same --reward-root so the "
+                             "logs are distinguishable. Defaults to PID.")
 
     # ----- Online WM fine-tuning -----
     parser.add_argument("--enable-wm-finetune", action="store_true",
@@ -885,9 +1160,49 @@ def main() -> None:
     parser.add_argument("--wm-max-grad-norm", type=float, default=1.0)
     parser.add_argument("--wm-buffer-size", type=int, default=64,
                         help="Max scored-episode tuples kept on CPU.")
+    parser.add_argument("--wm-buffer-freeze-at", type=int, default=0,
+                        help="If >0, once the WM finetune buffer reaches "
+                             "this many samples, further add_sample() calls "
+                             "are dropped (the cycle counter still ticks, "
+                             "so periodic fine-tune cycles still fire). "
+                             "Use to overfit on a fixed N trajectories. "
+                             "0 (default) = no freeze (rolling deque).")
     parser.add_argument("--wm-checkpoint-every", type=int, default=1,
                         help="Save checkpoint every N completed cycles. "
                              "0 disables checkpointing.")
+    parser.add_argument("--wm-self-loop", action="store_true",
+                        help="Once the buffer is non-empty (and, if "
+                             "--wm-buffer-freeze-at>0, full at the freeze "
+                             "threshold), keep firing fine-tune cycles "
+                             "back-to-back even when no new requests arrive. "
+                             "Used by the overfit harness so the trainer can "
+                             "exit after collecting the fixed buffer.")
+
+    # ----- Pretrain-replay mixing (anti-catastrophic-forgetting) -----
+    parser.add_argument("--wm-pretrain-root", default="",
+                        help="Root of the pretrain libero_processed/ tree. "
+                             "When set together with --wm-pretrain-suite and "
+                             "--wm-pretrain-num-trajs, a fraction "
+                             "(1 - --wm-mix-online) of each fine-tune batch "
+                             "is drawn from pretrain windows so the model "
+                             "doesn't drift off the base manifold while "
+                             "overfitting on a tiny online buffer.")
+    parser.add_argument("--wm-pretrain-suite", default="",
+                        help="Subdir under --wm-pretrain-root to sample "
+                             "pretrain trajectories from (e.g. libero_goal).")
+    parser.add_argument("--wm-pretrain-num-trajs", type=int, default=0,
+                        help="Number of pretrain episodes to preload into "
+                             "CPU memory. 0 (default) disables pretrain mix. "
+                             "Each traj is ~3-5 MB; 32-64 is plenty.")
+    parser.add_argument("--wm-mix-online", type=float, default=1.0,
+                        help="Per-window probability of drawing from the "
+                             "online buffer. 1.0 (default) = pure online "
+                             "(legacy behavior). 0.5 = balanced mix. 0.0 "
+                             "= pure pretrain (debug only). Ignored unless "
+                             "the three pretrain-* args above are set.")
+    parser.add_argument("--wm-pretrain-seed", type=int, default=0,
+                        help="RNG seed for picking which pretrain episodes "
+                             "are loaded at startup.")
 
     # ----- WM update sanity-check (before/after replay videos) -----
     parser.add_argument("--wm-sanity-check", type=int, default=1,
@@ -944,7 +1259,8 @@ def main() -> None:
             pipeline=pipeline, pipeline_cls=pipeline_cls, lpips_fn=lpips_fn,
         )
 
-    print(f"[server] ready. polling every {args.poll_interval}s")
+    worker_tag = str(getattr(args, "worker_id", "") or os.getpid())
+    print(f"[server:{worker_tag}] ready. polling every {args.poll_interval}s")
     serve(
         args=args,
         cfg=cfg,

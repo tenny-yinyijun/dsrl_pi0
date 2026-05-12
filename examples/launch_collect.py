@@ -86,6 +86,13 @@ if __name__ == '__main__':
     parser.add_argument('--reward_update_freq', default=-1, type=int,
                         help='Train reward + run SAC updates every Y '
                              'trajectories. -1 means use --traj_batch_size.')
+    parser.add_argument('--scored_per_round', default=-1, type=int,
+                        help='If >=0, exactly this many randomly-chosen '
+                             'trajectories per round (= --traj_batch_size '
+                             'trajs) are scored by the WM reward server; '
+                             'the rest are sent to the WM finetune buffer '
+                             '(server-side) without scoring. -1 (default) '
+                             '= score every trajectory.')
     parser.add_argument('--save_dir', default='',
                         help='Output directory in libero_processed layout. '
                              'Empty => <EXP>/<expname>/collected_data.')
@@ -97,6 +104,10 @@ if __name__ == '__main__':
     parser.add_argument('--fps', default=20, type=int)
     parser.add_argument('--sample_stride', default=2, type=int)
     parser.add_argument('--sample_start_offset', default=6, type=int)
+    parser.add_argument('--sample_wm_down_sample', default=4, type=int,
+                        help='Must match LiberoWMArgs.down_sample. Caps '
+                             'frame_now to num_frames // wm_down_sample so '
+                             'WM training samples are non-degenerate.')
     parser.add_argument('--settle_steps', default=10, type=int,
                         help='Number of zero-action env steps to take after '
                              'every libero env.reset() so objects settle to '
