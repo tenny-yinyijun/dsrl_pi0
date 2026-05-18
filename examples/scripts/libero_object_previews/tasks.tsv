@@ -1,0 +1,11 @@
+task_id	language	bddl_file
+0	pick up the alphabet soup and place it in the basket	pick_up_the_alphabet_soup_and_place_it_in_the_basket.bddl
+1	pick up the cream cheese and place it in the basket	pick_up_the_cream_cheese_and_place_it_in_the_basket.bddl
+2	pick up the salad dressing and place it in the basket	pick_up_the_salad_dressing_and_place_it_in_the_basket.bddl
+3	pick up the bbq sauce and place it in the basket	pick_up_the_bbq_sauce_and_place_it_in_the_basket.bddl
+4	pick up the ketchup and place it in the basket	pick_up_the_ketchup_and_place_it_in_the_basket.bddl
+5	pick up the tomato sauce and place it in the basket	pick_up_the_tomato_sauce_and_place_it_in_the_basket.bddl
+6	pick up the butter and place it in the basket	pick_up_the_butter_and_place_it_in_the_basket.bddl
+7	pick up the milk and place it in the basket	pick_up_the_milk_and_place_it_in_the_basket.bddl
+8	pick up the chocolate pudding and place it in the basket	pick_up_the_chocolate_pudding_and_place_it_in_the_basket.bddl
+9	pick up the orange juice and place it in the basket	pick_up_the_orange_juice_and_place_it_in_the_basket.bddl

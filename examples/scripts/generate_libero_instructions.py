@@ -67,13 +67,9 @@ _PROMPT_TEMPLATE = (
     "camera at the scene's initial state.\n\n"
     "The scene contains EXACTLY these objects and NOTHING else:\n"
     "{OBJECTS_BULLETED}\n"
-    "Do not invent or reference any object that is not in this list "
-    "(e.g. no spoon, no pot, no mug, no cream cheese, no apple, no knife, "
-    "etc.). Use the names from the list verbatim. In particular, when "
-    "referring to the cabinet's drawers ALWAYS say 'top drawer of the "
-    "cabinet' or 'bottom drawer of the cabinet' — never just 'the cabinet' "
-    "or 'the drawer'. Include at least one open and one close instruction "
-    "for each drawer.\n\n"
+    "Do not invent or reference any object that is not in this list. Use "
+    "the names from the list verbatim.\n\n"
+    "{EXTRA_RULES_BLOCK}"
     "Output {N} DIVERSE single-step manipulation instructions the robot "
     "could attempt in this exact scene. Each instruction MUST:\n"
     "  - be one short imperative sentence (under 12 words),\n"
@@ -92,9 +88,11 @@ _PROMPT_TEMPLATE = (
 )
 
 
-def _build_prompt(objects: list, n: int) -> str:
+def _build_prompt(objects: list, n: int, extra_rules: str = "") -> str:
     bulleted = "\n".join(f"  - {o}" for o in objects)
-    return _PROMPT_TEMPLATE.format(OBJECTS_BULLETED=bulleted, N=n)
+    extra_block = (extra_rules.strip() + "\n\n") if extra_rules.strip() else ""
+    return _PROMPT_TEMPLATE.format(
+        OBJECTS_BULLETED=bulleted, N=n, EXTRA_RULES_BLOCK=extra_block)
 
 
 def _img_to_b64_jpeg(image_uint8: np.ndarray) -> str:
@@ -165,6 +163,10 @@ def main():
                              "for instructions. Overrides the built-in "
                              "libero_goal_1 default. Example: "
                              "'cabinet,black bowl,plate,wine bottle,stove'.")
+    parser.add_argument("--extra-rules", default="",
+                        help="Optional scene-specific guidance injected into "
+                             "the VLM prompt verbatim (e.g. drawer naming "
+                             "rules for libero_goal_1). Empty by default.")
     args = parser.parse_args()
 
     if args.objects is None:
@@ -215,7 +217,7 @@ def main():
     from openai import OpenAI
 
     client = OpenAI()
-    prompt_text = _build_prompt(objects, args.num_instructions)
+    prompt_text = _build_prompt(objects, args.num_instructions, args.extra_rules)
     b64_agent = _img_to_b64_jpeg(agent)
     b64_wrist = _img_to_b64_jpeg(wrist)
 

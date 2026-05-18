@@ -152,6 +152,7 @@ if __name__ == '__main__':
         num_qs=10,
         action_magnitude=1.0,
         num_cameras=1,
+        actor_grad_clip=0.0,  # >0 enables optax.clip_by_global_norm on actor
     )
 
     variant, args = parse_training_args(train_args_dict, parser)

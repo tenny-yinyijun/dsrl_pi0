@@ -6,7 +6,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=80G
-#SBATCH --time=05:00:00
+#SBATCH --time=24:00:00
 #SBATCH --job-name=dsrl-wm-loop-collect-ft-seq-mt
 #SBATCH --output=slurm_outputs/%x/out_%x_%j.out
 #SBATCH --mail-type=FAIL
@@ -91,9 +91,9 @@ SCORED_PER_ROUND=$SAC_UPDATE_EVERY
 # WM fine-tune cadence (orchestrator-driven, NOT in-server)
 # ----------------------------------------------------------------------------
 WM_UPDATE_EVERY=200
-WM_TRAIN_STEPS_PER_CYCLE=1000
+WM_TRAIN_STEPS_PER_CYCLE=2000
 WM_TRAIN_BATCH_PER_GPU="${WM_TRAIN_BATCH_PER_GPU:-4}"
-WM_LR="${WM_LR:-1e-5}"
+WM_LR="${WM_LR:-5e-5}"
 WM_MAX_GRAD_NORM=1.0
 WM_NUM_WORKERS="${WM_NUM_WORKERS:-0}"
 WM_CKPT_EVERY_STEPS="${WM_CKPT_EVERY_STEPS:-$WM_TRAIN_STEPS_PER_CYCLE}"
@@ -105,9 +105,14 @@ WM_BUFFER_SIZE="${WM_BUFFER_SIZE:-400}"
 # ----------------------------------------------------------------------------
 WARMUP_TRAJS="${WARMUP_TRAJS:-20}"
 MULTI_GRAD_STEP=20
-ACTION_MAGNITUDE=1.0
-BASE_POLICY_PROB=0.5
+ACTION_MAGNITUDE="${ACTION_MAGNITUDE:-1.0}"
+BASE_POLICY_PROB="${BASE_POLICY_PROB:-0.2}"
 TARGET_ENTROPY="${TARGET_ENTROPY:-3.5}"
+# Dampers on SAC actor updates: lower LR + global-norm grad clip together
+# bound how much the policy can move per step, preventing the intermittent
+# "robot does weird things after an update" failure mode.
+ACTOR_LR="${ACTOR_LR:-3e-5}"
+ACTOR_GRAD_CLIP="${ACTOR_GRAD_CLIP:-1.0}"
 
 # ----------------------------------------------------------------------------
 # Reward model (per-step LPIPS regressor on top of WM scores)
@@ -269,6 +274,8 @@ cat > "$CONFIG_PATH" <<EOF
     "update_every_trajs": $SAC_UPDATE_EVERY,
     "multi_grad_step": $MULTI_GRAD_STEP,
     "target_entropy": "$TARGET_ENTROPY",
+    "actor_lr": $ACTOR_LR,
+    "actor_grad_clip": $ACTOR_GRAD_CLIP,
     "ckpt_every_trajs": $SAC_CKPT_TRAJS,
     "checkpoint_interval_sac_steps": $CHECKPOINT_INTERVAL,
     "warmup_trajs": $WARMUP_TRAJS,
@@ -306,7 +313,9 @@ echo "[mt-seq] REWARD_ROOT=$REWARD_ROOT"
 echo "[mt-seq] POLICY=$POLICY  QUERY_FREQ=$QUERY_FREQ"
 echo "[mt-seq] multitask instruction list: $INSTRUCTION_LIST"
 echo "[mt-seq] SAC update_every=$SAC_UPDATE_EVERY trajs  multi_grad_step=$MULTI_GRAD_STEP  target_entropy=$TARGET_ENTROPY"
+echo "[mt-seq] SAC actor_lr=$ACTOR_LR  actor_grad_clip=$ACTOR_GRAD_CLIP  action_magnitude=$ACTION_MAGNITUDE"
 echo "[mt-seq] WM FT cycle every $WM_UPDATE_EVERY scored trajs, $WM_TRAIN_STEPS_PER_CYCLE DDP steps per cycle  buffer=$WM_BUFFER_SIZE"
+echo "[mt-seq] WM FT lr=$WM_LR  carry_optimizer_state=yes (from cycle 2 onward)"
 echo "[mt-seq] WM scoring: passes=$NUM_PASSES  windows_per_call=$WINDOWS_PER_CALL  inf_steps=$NUM_INFERENCE_STEPS"
 echo "[mt-seq] GPUs: REWARD_GPUS=$REWARD_GPUS  TRAINER_GPU=$TRAINER_GPU"
 nvidia-smi -L | head -8 || true
@@ -350,6 +359,8 @@ python3 examples/launch_collect.py \
     --start_online_updates "$START_ONLINE_UPDATES" \
     --resize_image 64 \
     --action_magnitude "$ACTION_MAGNITUDE" \
+    --actor_lr "$ACTOR_LR" \
+    --actor_grad_clip "$ACTOR_GRAD_CLIP" \
     --query_freq "$QUERY_FREQ" \
     --hidden_dims 128 \
     --use_reward_model 1 \
@@ -373,7 +384,7 @@ python3 examples/launch_collect.py \
     --fps 20 \
     --sample_stride 2 \
     --sample_start_offset 6 \
-    --sample_wm_down_sample 4 \
+    --sample_wm_down_sample 1 \
     --max_trajs "$MAX_TRAJS" \
     --target_entropy "$TARGET_ENTROPY" \
     > "$TRAINER_LOG" 2>&1 &
@@ -396,27 +407,31 @@ start_phase_a() {
         local log="$LOG_DIR/reward_server_cycle${cycle_n}_w${idx}_gpu${g}.log"
         SERVER_LOGS+=("$log")
         echo "[mt-seq] starting worker $idx on GPU $g  (logs -> $log)"
+        # `exec` so $! is the python pid (not the bash subshell pid). Without
+        # exec, SIGTERM to the subshell kills bash but orphans the python
+        # process — it keeps holding the GPU and host RAM into the next
+        # cycle, eventually OOMing phase B.
         (
             cd "$OPEN_WORLD_ROOT"
-            CUDA_VISIBLE_DEVICES=$g \
-            OPEN_WORLD_ROOT="$OPEN_WORLD_ROOT" \
-            HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
-            PYTHONUNBUFFERED=1 \
-            "$OPEN_WORLD_ROOT/.venv/bin/python" -u \
-                "$DSRL_ROOT/examples/reward_model/reward_server.py" \
-                --reward-root "$REWARD_ROOT" \
-                --ckpt-path "$ckpt" \
-                --dataset-root "$WM_DATASET_ROOT" \
-                --num-windows "$NUM_WINDOWS" \
-                --num-passes "$NUM_PASSES" \
-                --windows-per-call "$WINDOWS_PER_CALL" \
-                $( [ "$RANDOM_SPREAD" = "1" ] && echo "--random-spread" ) \
-                --start-frame "$START_FRAME" \
-                --num-inference-steps "$NUM_INFERENCE_STEPS" \
-                --scoring-mode "$SCORING_MODE" \
-                --device "cuda:0" \
-                --worker-id "c${cycle_n}_w${idx}_gpu${g}" \
-                > "$log" 2>&1
+            exec env CUDA_VISIBLE_DEVICES=$g \
+                OPEN_WORLD_ROOT="$OPEN_WORLD_ROOT" \
+                HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+                PYTHONUNBUFFERED=1 \
+                "$OPEN_WORLD_ROOT/.venv/bin/python" -u \
+                    "$DSRL_ROOT/examples/reward_model/reward_server.py" \
+                    --reward-root "$REWARD_ROOT" \
+                    --ckpt-path "$ckpt" \
+                    --dataset-root "$WM_DATASET_ROOT" \
+                    --num-windows "$NUM_WINDOWS" \
+                    --num-passes "$NUM_PASSES" \
+                    --windows-per-call "$WINDOWS_PER_CALL" \
+                    $( [ "$RANDOM_SPREAD" = "1" ] && echo "--random-spread" ) \
+                    --start-frame "$START_FRAME" \
+                    --num-inference-steps "$NUM_INFERENCE_STEPS" \
+                    --scoring-mode "$SCORING_MODE" \
+                    --device "cuda:0" \
+                    --worker-id "c${cycle_n}_w${idx}_gpu${g}" \
+                    > "$log" 2>&1
         ) &
         SERVER_PIDS+=("$!")
         echo "[mt-seq]   worker $idx pid=${SERVER_PIDS[$idx]}"
@@ -462,6 +477,19 @@ stop_phase_a() {
     for pid in "${SERVER_PIDS[@]}"; do
         kill -9 "$pid" 2>/dev/null || true
     done
+    # Belt-and-suspenders: kill any reward_server.py still resident under
+    # this SLURM job (covers pre-exec subshells from older runs, double-fork
+    # cases, or anything that escaped our PID tracking).
+    pkill -9 -u "$(id -u)" -f "examples/reward_model/reward_server.py" 2>/dev/null || true
+    # Wait for actual process exit so the GPUs are free before phase B.
+    for _ in $(seq 1 30); do
+        pgrep -u "$(id -u)" -f "examples/reward_model/reward_server.py" >/dev/null || break
+        sleep 1
+    done
+    if pgrep -u "$(id -u)" -f "examples/reward_model/reward_server.py" >/dev/null; then
+        echo "[mt-seq] WARN: reward_server processes still present after 30s; continuing anyway"
+        pgrep -u "$(id -u)" -af "examples/reward_model/reward_server.py" || true
+    fi
     local requests_dir="$REWARD_ROOT/requests"
     if [ -d "$requests_dir" ]; then
         local recovered=0
@@ -486,8 +514,22 @@ latest_wm_checkpoint() {
 }
 
 run_phase_b() {
-    local cycle_n="$1" ckpt_in="$2"
-    echo "[mt-seq] ====== PHASE B start  cycle=$cycle_n  ckpt_in=$(basename "$ckpt_in") ======"
+    local cycle_n="$1" ckpt_in="$2" opt_state_in="${3:-}"
+    echo "[mt-seq] ====== PHASE B start  cycle=$cycle_n  ckpt_in=$(basename "$ckpt_in")"\
+        "opt_state_in=$( [ -n "$opt_state_in" ] && basename "$opt_state_in" || echo none ) ======"
+
+    # Verify the reward GPUs are actually idle. If a prior cycle's
+    # reward_server.py leaked, its ~12 GiB residue will collide with the
+    # DDP trainer and OOM us partway through. Bail loudly here instead.
+    for g in "${REWARD_GPU_ARR[@]}"; do
+        local used
+        used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$g" 2>/dev/null | tr -d ' ')
+        if [ -n "$used" ] && [ "$used" -gt 1000 ]; then
+            echo "[mt-seq] FATAL: GPU $g still has ${used} MiB used before phase B."
+            nvidia-smi -i "$g" || true
+            return 1
+        fi
+    done
 
     local out_dir="$WM_CKPT_ROOT/cycle_${cycle_n}"
     mkdir -p "$out_dir"
@@ -552,6 +594,16 @@ PYEOF
         return $filter_rc
     fi
 
+    # Python literal for the optimizer-state field: a quoted path, or None
+    # on the first cycle (and any cycle where the prior optimizer state went
+    # missing for some reason — train_wm.py will warn and start fresh).
+    local opt_state_py
+    if [ -n "$opt_state_in" ] && [ -f "$opt_state_in" ]; then
+        opt_state_py="\"${opt_state_in}\""
+    else
+        opt_state_py="None"
+    fi
+
     local cfg_path="$LOG_DIR/wm_train_config_cycle_${cycle_n}.py"
     cat > "$cfg_path" <<PYEOF
 """Auto-generated FT config for cycle ${cycle_n} (multitask variant)."""
@@ -564,6 +616,9 @@ def get_args() -> LiberoWMArgs:
         svd_model_path="external/stable-video-diffusion-img2vid",
         clip_model_path="external/clip-vit-base-patch32",
         ckpt_path="${ckpt_in}",
+        # Carry AdamW momentum/variance across orchestrated cycles so each
+        # cycle isn't ~hundreds of steps of warm-up noise. None on cycle 1.
+        optimizer_state_path=${opt_state_py},
 
         dataset_root_path="${cycle_view}",
         dataset_meta_info_path="${WM_DATASET_ROOT}",
@@ -586,7 +641,11 @@ def get_args() -> LiberoWMArgs:
         num_frames=5,
         num_history=6,
         action_dim=7,
-        down_sample=4,
+        # See libero_wm.py: down_sample=1 matches the actual data layout
+        # (T_state == T_latent at 20 Hz), training on the full trajectory
+        # with 1:1 state<->latent pairing. The legacy base ckpt was trained
+        # with down_sample=4, so cycle 1 sees a transient loss bump.
+        down_sample=1,
 
         flow_map_type="flow_matching",
         distance_conditioning=False,
@@ -692,6 +751,7 @@ TAIL_PID=$!
 # Main orchestrator loop
 # ---------------------------------------------------------------------------
 CURRENT_WM_CKPT="$WM_CKPT_INITIAL"
+CURRENT_WM_OPT_STATE=""   # populated after cycle 1 — base ckpt has no optimizer state
 cycle_n=0
 next_threshold="$WM_UPDATE_EVERY"
 
@@ -704,7 +764,7 @@ while kill -0 "$TRAINER_PID" 2>/dev/null; do
         cycle_n=$((cycle_n + 1))
         echo "[mt-seq] threshold hit: scores=$n_scores >= $next_threshold  → trigger phase B cycle $cycle_n"
         stop_phase_a
-        if ! run_phase_b "$cycle_n" "$CURRENT_WM_CKPT"; then
+        if ! run_phase_b "$cycle_n" "$CURRENT_WM_CKPT" "$CURRENT_WM_OPT_STATE"; then
             echo "[mt-seq] phase B failed; exiting orchestrator."
             exit 1
         fi
@@ -714,8 +774,24 @@ while kill -0 "$TRAINER_PID" 2>/dev/null; do
             exit 1
         fi
         CURRENT_WM_CKPT="$new_ckpt"
+        # train_wm.py writes optimizer-<step>.pt alongside checkpoint-<step>.pt
+        new_opt="${new_ckpt/checkpoint-/optimizer-}"
+        if [ -f "$new_opt" ]; then
+            # The optimizer state we just consumed (CURRENT_WM_OPT_STATE) is
+            # never needed again — it only existed to seed this cycle. Drop it
+            # so disk usage stays at ~1 optimizer file (~18 GB) instead of
+            # accumulating one per cycle. Set KEEP_OPT_STATES=1 to retain.
+            if [ -z "${KEEP_OPT_STATES:-}" ] && [ -n "$CURRENT_WM_OPT_STATE" ] && [ -f "$CURRENT_WM_OPT_STATE" ]; then
+                rm -f "$CURRENT_WM_OPT_STATE" \
+                    && echo "[mt-seq] reclaimed prior optimizer state: $CURRENT_WM_OPT_STATE"
+            fi
+            CURRENT_WM_OPT_STATE="$new_opt"
+        else
+            echo "[mt-seq] WARN: expected optimizer state at $new_opt but not found; next cycle will start fresh"
+            CURRENT_WM_OPT_STATE=""
+        fi
         next_threshold=$((next_threshold + WM_UPDATE_EVERY))
-        echo "[mt-seq] new WM checkpoint: $CURRENT_WM_CKPT  → restarting phase A; next threshold=$next_threshold"
+        echo "[mt-seq] new WM checkpoint: $CURRENT_WM_CKPT  opt_state=$CURRENT_WM_OPT_STATE  → restarting phase A; next threshold=$next_threshold"
         start_phase_a "$CURRENT_WM_CKPT" "$cycle_n"
     else
         sleep "$PHASE_TRIGGER_POLL_S"

@@ -1,0 +1,11 @@
+task_id	language	bddl_file
+0	open the middle drawer of the cabinet	open_the_middle_drawer_of_the_cabinet.bddl
+1	put the bowl on the stove	put_the_bowl_on_the_stove.bddl
+2	put the wine bottle on top of the cabinet	put_the_wine_bottle_on_top_of_the_cabinet.bddl
+3	open the top drawer and put the bowl inside	open_the_top_drawer_and_put_the_bowl_inside.bddl
+4	put the bowl on top of the cabinet	put_the_bowl_on_top_of_the_cabinet.bddl
+5	push the plate to the front of the stove	push_the_plate_to_the_front_of_the_stove.bddl
+6	put the cream cheese in the bowl	put_the_cream_cheese_in_the_bowl.bddl
+7	turn on the stove	turn_on_the_stove.bddl
+8	put the bowl on the plate	put_the_bowl_on_the_plate.bddl
+9	put the wine bottle on the rack	put_the_wine_bottle_on_the_rack.bddl

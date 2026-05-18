@@ -93,7 +93,7 @@ def main(variant):
         variant.task_description = task_description
         variant.bddl_name = pathlib.Path(task.bddl_file).stem
         variant.env_max_reward = 1
-        variant.max_timesteps = 400
+        variant.max_timesteps = 300
 
         # Optional: load a pre-generated instruction list (multitask
         # variant). Each rollout's prompt to π₀ will be sampled uniformly

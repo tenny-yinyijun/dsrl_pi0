@@ -123,7 +123,8 @@ class PixelSACLearner(Agent):
                  num_qs: int = 2,
                  target_entropy: float = None,
                  action_magnitude: float = 1.0,
-                 num_cameras: int = 1
+                 num_cameras: int = 1,
+                 actor_grad_clip: float = 0.0,
                  ):
         """
         An implementation of the version of Soft-Actor-Critic described in https://arxiv.org/abs/1812.05905
@@ -184,9 +185,20 @@ class PixelSACLearner(Agent):
         actor_params = actor_def_init['params']
         actor_batch_stats = actor_def_init['batch_stats'] if 'batch_stats' in actor_def_init else None
 
+        # Optional global-norm clip on actor grads. Caps the per-step parameter
+        # change magnitude — useful when occasional large Q-gradient spikes
+        # push the policy into out-of-distribution regions and the robot
+        # produces visibly bad actions for a few rollouts. Disabled at 0.
+        if actor_grad_clip and actor_grad_clip > 0:
+            actor_tx = optax.chain(
+                optax.clip_by_global_norm(float(actor_grad_clip)),
+                optax.adam(learning_rate=actor_lr),
+            )
+        else:
+            actor_tx = optax.adam(learning_rate=actor_lr)
         actor = TrainState.create(apply_fn=actor_def.apply,
                                   params=actor_params,
-                                  tx=optax.adam(learning_rate=actor_lr),
+                                  tx=actor_tx,
                                   batch_stats=actor_batch_stats)
 
         critic_def = StateActionEnsemble(hidden_dims, num_qs=num_qs)
